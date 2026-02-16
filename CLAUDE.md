@@ -53,6 +53,20 @@ make clean    # Clean build artifacts
 
 ## Key Files
 - `include/gs_types.h` - Core data structures (SoA Gaussians, tiles)
+- `src/gs_projector.cpp` - 3D→2D projection, SH evaluation, Jacobian (most complex file)
+- `src/gs_rasterizer.cpp` - NEON tile-based rasterizer (4-thread, front-to-back)
 - `src/gs_renderer.cpp` - Rendering pipeline orchestrator
-- `src/gs_rasterizer.cpp` - NEON tile-based rasterizer
-- `src/gs_display.cpp` - AX_VO HDMI output
+- `src/gs_display.cpp` - AX_VO HDMI output (with /dev/fb0 fallback)
+- `docs/RENDERING_DEBUG.md` - **Rendering quality debug status and analysis**
+
+## Current Status (2026-02-17)
+Rendering pipeline runs end-to-end but output images are visually broken.
+See `docs/RENDERING_DEBUG.md` for detailed analysis and next steps.
+
+## Test Scenes
+PLY files at `~/ply/`: Mars.ply, Auditorium.ply, InteriorDesign.ply (SH degree 3).
+
+Dump mode (render to JPEG without display):
+```bash
+sudo build/gs_splat ~/ply/Mars.ply -s 2 --dump /tmp/dump_mars -n 8
+```
