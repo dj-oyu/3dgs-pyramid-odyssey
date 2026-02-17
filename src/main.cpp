@@ -111,20 +111,22 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Initialize system
-    if (!gs_sys_init()) {
-        fprintf(stderr, "Failed to initialize AX system\n");
-        return 1;
+    // Initialize system (skip for dump mode - no AX hardware needed)
+    bool headless = (dump_dir != nullptr);
+    if (!headless) {
+        if (!gs_sys_init()) {
+            fprintf(stderr, "Failed to initialize AX system\n");
+            return 1;
+        }
+        gs_cmm_print_status();
     }
-
-    gs_cmm_print_status();
 
     // Load PLY
     printf("Loading %s...\n", ply_path);
     GaussianScene scene;
     if (!gs_ply_load(ply_path, scene)) {
         fprintf(stderr, "Failed to load PLY: %s\n", ply_path);
-        gs_sys_deinit();
+        if (!headless) gs_sys_deinit();
         return 1;
     }
 
@@ -132,17 +134,17 @@ int main(int argc, char *argv[]) {
 
     if (info_only) {
         gs_scene_free(scene);
-        gs_sys_deinit();
+        if (!headless) gs_sys_deinit();
         return 0;
     }
 
     // Initialize renderer (at render resolution)
     Renderer renderer;
     renderer.display.fb_vsync = vsync;
-    if (!gs_renderer_init(renderer, render_w, render_h)) {
+    if (!gs_renderer_init(renderer, render_w, render_h, headless)) {
         fprintf(stderr, "Failed to initialize renderer\n");
         gs_scene_free(scene);
-        gs_sys_deinit();
+        if (!headless) gs_sys_deinit();
         return 1;
     }
 
@@ -163,16 +165,34 @@ int main(int argc, char *argv[]) {
         snprintf(cmd, sizeof(cmd), "mkdir -p %s", dump_dir);
         system(cmd);
 
-        float cx = (scene.bbox_min[0] + scene.bbox_max[0]) * 0.5f;
-        float cy = (scene.bbox_min[1] + scene.bbox_max[1]) * 0.5f;
-        float cz = (scene.bbox_min[2] + scene.bbox_max[2]) * 0.5f;
-        float dx = scene.bbox_max[0] - scene.bbox_min[0];
-        float dy = scene.bbox_max[1] - scene.bbox_min[1];
-        float dz = scene.bbox_max[2] - scene.bbox_min[2];
-        float extent = sqrtf(dx*dx + dy*dy + dz*dz);
+        // Compute robust scene center using mean of Gaussian positions
+        // (much better than bbox center which is skewed by outliers)
+        float cx = 0, cy = 0, cz = 0;
+        for (uint32_t gi = 0; gi < scene.num_gaussians; gi++) {
+            cx += scene.pos_x[gi];
+            cy += scene.pos_y[gi];
+            cz += scene.pos_z[gi];
+        }
+        cx /= scene.num_gaussians;
+        cy /= scene.num_gaussians;
+        cz /= scene.num_gaussians;
+
+        // Compute typical distance of Gaussians from center (use RMS for robustness)
+        float rms_dist = 0;
+        for (uint32_t gi = 0; gi < scene.num_gaussians; gi++) {
+            float ddx = scene.pos_x[gi] - cx;
+            float ddy = scene.pos_y[gi] - cy;
+            float ddz = scene.pos_z[gi] - cz;
+            rms_dist += ddx*ddx + ddy*ddy + ddz*ddz;
+        }
+        rms_dist = sqrtf(rms_dist / scene.num_gaussians);
+
+        // Use RMS distance as a better "extent" for camera placement
+        // Camera should be at roughly 1-2x RMS distance from center
+        float scene_radius = rms_dist;
 
         // Print scene diagnostics
-        printf("[dump] Scene center: (%.2f, %.2f, %.2f), extent: %.2f\n", cx, cy, cz, extent);
+        printf("[dump] Mean center: (%.2f, %.2f, %.2f), RMS radius: %.2f\n", cx, cy, cz, scene_radius);
         printf("[dump] BBox: (%.2f..%.2f, %.2f..%.2f, %.2f..%.2f)\n",
                scene.bbox_min[0], scene.bbox_max[0],
                scene.bbox_min[1], scene.bbox_max[1],
@@ -187,25 +207,26 @@ int main(int argc, char *argv[]) {
                    scene.opacity[idx]);
         }
 
-        // Viewpoints: mix of default view, close orbits, and medium orbits
+        // Viewpoints: orbit around mean center at various distances
+        // Distance based on RMS radius (much closer than bbox diagonal)
         for (int vi = 0; vi < dump_count; vi++) {
             float dist, angle, elev;
 
             if (vi == 0) {
-                // Default view: same as gs_camera_reset (along +Z)
-                dist = extent * 1.2f;
-                angle = M_PI * 0.5f;  // +Z direction
+                // Front view: close
+                dist = scene_radius * 1.5f;
+                angle = M_PI * 0.5f;
                 elev = 0.0f;
             } else if (vi <= dump_count / 2) {
-                // Close orbit (0.3-0.5 * extent)
+                // Close orbit (0.5-1.0 * radius)
                 angle = (float)(vi - 1) / (float)(dump_count / 2) * 2.0f * M_PI;
                 elev = -0.15f + 0.3f * ((vi % 3) / 2.0f);
-                dist = extent * (0.3f + 0.2f * ((vi % 3) / 2.0f));
+                dist = scene_radius * (0.5f + 0.5f * ((vi % 3) / 2.0f));
             } else {
-                // Medium orbit (0.6-0.9 * extent)
+                // Medium orbit (1.0-2.0 * radius)
                 angle = (float)(vi - dump_count/2) / (float)(dump_count - dump_count/2) * 2.0f * M_PI;
                 elev = -0.25f + 0.5f * ((vi % 3) / 2.0f);
-                dist = extent * (0.6f + 0.3f * ((vi % 3) / 2.0f));
+                dist = scene_radius * (1.0f + 1.0f * ((vi % 3) / 2.0f));
             }
 
             camera.pos[0] = cx + dist * cosf(elev) * cosf(angle);
@@ -228,6 +249,43 @@ int main(int argc, char *argv[]) {
             gs_renderer_render_frame(renderer, scene, cam_params);
 
             const RenderStats &stats = gs_renderer_get_stats(renderer);
+
+            // Print projection diagnostics for first frame
+            if (vi == 0) {
+                const ProjectedGaussian *pgs = renderer.projection.gaussians;
+                uint32_t pc = renderer.projection.count;
+                float max_radius = 0, avg_radius = 0;
+                uint32_t spike_count = 0;  // eigenvalue ratio > 100
+                float max_eigen_ratio = 0;
+                for (uint32_t pi = 0; pi < pc; pi++) {
+                    float a = pgs[pi].cov2d_a, b = pgs[pi].cov2d_b, c = pgs[pi].cov2d_c;
+                    float det = a * c - b * b;
+                    float mid = 0.5f * (a + c);
+                    float disc = mid * mid - det;
+                    float lmax = mid + sqrtf(fmaxf(0.0f, disc));
+                    float lmin = mid - sqrtf(fmaxf(0.0f, disc));
+                    if (lmin < 0.001f) lmin = 0.001f;
+                    float ratio = lmax / lmin;
+                    if (ratio > max_eigen_ratio) max_eigen_ratio = ratio;
+                    if (ratio > 100.0f) spike_count++;
+                    avg_radius += pgs[pi].radius;
+                    if (pgs[pi].radius > max_radius) max_radius = pgs[pi].radius;
+                }
+                avg_radius /= (pc > 0 ? pc : 1);
+                printf("[diag] Projected: %u gaussians\n", pc);
+                printf("[diag] Radius: avg=%.1f max=%.1f\n", avg_radius, max_radius);
+                printf("[diag] Eigenvalue ratio: max=%.1f, spikes(>100x)=%u (%.1f%%)\n",
+                       max_eigen_ratio, spike_count, 100.0f * spike_count / (pc > 0 ? pc : 1));
+                // Sample a few projected Gaussians
+                for (uint32_t si = 0; si < 5 && si < pc; si++) {
+                    uint32_t pi = si * (pc / 5);
+                    printf("[diag] PG[%u]: screen=(%.1f,%.1f) depth=%.2f radius=%.1f "
+                           "cov=(%.2f,%.2f,%.2f) color=(%.2f,%.2f,%.2f) opacity=%.2f\n",
+                           pi, pgs[pi].screen_x, pgs[pi].screen_y, pgs[pi].depth,
+                           pgs[pi].radius, pgs[pi].cov2d_a, pgs[pi].cov2d_b, pgs[pi].cov2d_c,
+                           pgs[pi].color_r, pgs[pi].color_g, pgs[pi].color_b, pgs[pi].opacity);
+                }
+            }
 
             // Save PPM
             Framebuffer &fb = renderer.framebuffers[1 - renderer.current_fb];  // last rendered
@@ -261,7 +319,7 @@ int main(int argc, char *argv[]) {
 
         gs_renderer_deinit(renderer);
         gs_scene_free(scene);
-        gs_sys_deinit();
+        if (!headless) gs_sys_deinit();
         return 0;
     }
 

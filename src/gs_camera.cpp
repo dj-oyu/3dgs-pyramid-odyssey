@@ -176,17 +176,29 @@ void gs_camera_get_params(const Camera &cam, uint32_t width, uint32_t height, Ca
 }
 
 void gs_camera_reset(Camera &cam, const GaussianScene &scene) {
-    float cx = (scene.bbox_min[0] + scene.bbox_max[0]) * 0.5f;
-    float cy = (scene.bbox_min[1] + scene.bbox_max[1]) * 0.5f;
-    float cz = (scene.bbox_min[2] + scene.bbox_max[2]) * 0.5f;
+    // Use mean position for center (robust against outliers)
+    float cx = 0, cy = 0, cz = 0;
+    for (uint32_t i = 0; i < scene.num_gaussians; i++) {
+        cx += scene.pos_x[i];
+        cy += scene.pos_y[i];
+        cz += scene.pos_z[i];
+    }
+    cx /= scene.num_gaussians;
+    cy /= scene.num_gaussians;
+    cz /= scene.num_gaussians;
 
-    float dx = scene.bbox_max[0] - scene.bbox_min[0];
-    float dy = scene.bbox_max[1] - scene.bbox_min[1];
-    float dz = scene.bbox_max[2] - scene.bbox_min[2];
-    float extent = sqrtf(dx*dx + dy*dy + dz*dz);
+    // RMS distance from center as scene radius
+    float rms_dist = 0;
+    for (uint32_t i = 0; i < scene.num_gaussians; i++) {
+        float dx = scene.pos_x[i] - cx;
+        float dy = scene.pos_y[i] - cy;
+        float dz = scene.pos_z[i] - cz;
+        rms_dist += dx*dx + dy*dy + dz*dz;
+    }
+    float extent = sqrtf(rms_dist / scene.num_gaussians);
 
-    // Position camera at a reasonable distance
-    float dist = extent * 1.2f;
+    // Position camera at 1.5x RMS distance
+    float dist = extent * 1.5f;
     cam.pos[0] = cx;
     cam.pos[1] = cy;
     cam.pos[2] = cz + dist;
@@ -200,9 +212,8 @@ void gs_camera_reset(Camera &cam, const GaussianScene &scene) {
     if (cam.move_speed < 0.01f) cam.move_speed = 0.01f;
 
     // Adjust near/far planes to scene size
-    cam.near_plane = extent * 0.001f;
-    if (cam.near_plane < 0.01f) cam.near_plane = 0.01f;
-    cam.far_plane = extent * 5.0f;
+    cam.near_plane = 0.01f;
+    cam.far_plane = extent * 50.0f;
     if (cam.far_plane < 100.0f) cam.far_plane = 100.0f;
 
     // Store for 'R' key reset

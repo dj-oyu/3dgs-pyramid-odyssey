@@ -60,13 +60,13 @@ make clean    # Clean build artifacts
 - `docs/RENDERING_DEBUG.md` - **Rendering quality debug status and analysis**
 
 ## Current Status (2026-02-17)
-Rendering pipeline runs end-to-end but output images are visually broken.
-See `docs/RENDERING_DEBUG.md` for detailed analysis and next steps.
+Rendering pipeline produces correct output. Root cause was camera placement (too far from
+scene center). See `docs/RENDERING_DEBUG.md` for full debug history.
 
 ## Test Scenes
 PLY files at `~/ply/`: Mars.ply, Auditorium.ply, InteriorDesign.ply (SH degree 3).
 
-Dump mode (render to JPEG without display):
+Dump mode (render to JPEG without display, no sudo required):
 ```bash
-sudo build/gs_splat ~/ply/Mars.ply -s 2 --dump /tmp/dump_mars -n 8
+build/gs_splat ~/ply/Mars.ply -s 2 --dump data/dump/mars -n 8
 ```

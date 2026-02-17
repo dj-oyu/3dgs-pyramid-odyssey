@@ -6,6 +6,9 @@
 #include <cstdio>
 #include <arm_neon.h>
 
+// Max eigenvalue ratio for 2D covariance (prevents spike artifacts)
+static constexpr float MAX_EIGEN_RATIO = 200.0f;
+
 bool gs_projection_alloc(ProjectionResult &result, uint32_t max_gaussians) {
     size_t size = max_gaussians * sizeof(ProjectedGaussian);
     void *ptr = nullptr;
@@ -248,7 +251,28 @@ static inline bool project_one(
 
     float mid = 0.5f * (cov2d_a + cov2d_c);
     float disc = mid * mid - det;
-    float lambda_max = mid + sqrtf(fmaxf(0.0f, disc));
+    float sqrt_disc = sqrtf(fmaxf(0.0f, disc));
+    float lambda_max = mid + sqrt_disc;
+    float lambda_min = fmaxf(0.3f, mid - sqrt_disc);
+
+    // Cap eigenvalue ratio to prevent extreme spike artifacts
+    // When a Gaussian is very close to the camera, perspective projection can
+    // create extreme aspect ratios (>1000:1), causing needle-like artifacts.
+    constexpr float MAX_EIGEN_RATIO = 200.0f;
+    if (lambda_max > MAX_EIGEN_RATIO * lambda_min) {
+        // Inflate the covariance to reduce aspect ratio
+        // Add isotropic component: inflate both eigenvalues equally
+        float target_min = lambda_max / MAX_EIGEN_RATIO;
+        float inflate = target_min - lambda_min;
+        cov2d_a += inflate;
+        cov2d_c += inflate;
+        // Recompute for radius
+        det = cov2d_a * cov2d_c - cov2d_b * cov2d_b;
+        mid = 0.5f * (cov2d_a + cov2d_c);
+        disc = mid * mid - det;
+        lambda_max = mid + sqrtf(fmaxf(0.0f, disc));
+    }
+
     float radius = 3.0f * sqrtf(lambda_max);
 
     if (radius > screen_w) return false;  // cap enormous Gaussians
@@ -398,7 +422,22 @@ void gs_project(const GaussianScene &scene, const CameraParams &cam, ProjectionR
 
             float mid = 0.5f * (cov2d_a + cov2d_c);
             float disc = mid * mid - det;
-            float lambda_max = mid + sqrtf(fmaxf(0.0f, disc));
+            float sqrt_disc = sqrtf(fmaxf(0.0f, disc));
+            float lambda_max = mid + sqrt_disc;
+            float lambda_min = fmaxf(0.3f, mid - sqrt_disc);
+
+            // Cap eigenvalue ratio to prevent spike artifacts
+            if (lambda_max > MAX_EIGEN_RATIO * lambda_min) {
+                float target_min = lambda_max / MAX_EIGEN_RATIO;
+                float inflate = target_min - lambda_min;
+                cov2d_a += inflate;
+                cov2d_c += inflate;
+                det = cov2d_a * cov2d_c - cov2d_b * cov2d_b;
+                mid = 0.5f * (cov2d_a + cov2d_c);
+                disc = mid * mid - det;
+                lambda_max = mid + sqrtf(fmaxf(0.0f, disc));
+            }
+
             float radius = 3.0f * sqrtf(lambda_max);
 
             if (radius > screen_w) continue;  // cap enormous Gaussians

@@ -10,29 +10,31 @@ static double get_time_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height) {
-    // Initialize display (uses its own default resolution from DisplayContext)
-    if (!gs_display_init(r.display)) {
-        fprintf(stderr, "[gs_renderer] Display init failed\n");
-        return false;
+bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headless) {
+    if (!headless) {
+        // Initialize display (uses its own default resolution from DisplayContext)
+        if (!gs_display_init(r.display)) {
+            fprintf(stderr, "[gs_renderer] Display init failed\n");
+            return false;
+        }
     }
 
     r.render_width = width;
     r.render_height = height;
 
     // Allocate double framebuffers at render resolution
-    // Use cached memory (need_phys=false) for FB backend - much faster for CPU writes
-    bool need_phys = (r.display.backend == DisplayBackend::VO);
+    // Use cached memory (need_phys=false) for headless or FB backend
+    bool need_phys = !headless && (r.display.backend == DisplayBackend::VO);
     for (int i = 0; i < 2; i++) {
         if (!gs_framebuffer_alloc(r.framebuffers[i], width, height, need_phys)) {
             fprintf(stderr, "[gs_renderer] Framebuffer %d alloc failed\n", i);
-            gs_display_deinit(r.display);
+            if (!headless) gs_display_deinit(r.display);
             return false;
         }
     }
     r.current_fb = 0;
 
-    if (width != r.display.width || height != r.display.height) {
+    if (!headless && width != r.display.width && height != r.display.height) {
         r.needs_upscale = true;
         printf("[gs_renderer] Upscale: %ux%u -> %ux%u (in display layer)\n",
                width, height, r.display.width, r.display.height);

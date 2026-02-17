@@ -21,7 +21,8 @@ struct Renderer {
 };
 
 // Initialize renderer (display, framebuffers, raster context)
-bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height);
+// headless=true skips display init (for dump mode without AX_SYS)
+bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headless = false);
 void gs_renderer_deinit(Renderer &r);
 
 // Render one frame: project → sort → rasterize → display

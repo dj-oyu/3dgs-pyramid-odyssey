@@ -1,5 +1,7 @@
 build/
 data/*.ply
+data/reference/
+data/dump/
 *.o
 *.d
 /tmp/
