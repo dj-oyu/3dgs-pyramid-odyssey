@@ -47,6 +47,7 @@ static void print_usage(const char *prog) {
     printf("  -s <scale>    Render scale 1=full, 2=half, 4=quarter (default: 1)\n");
     printf("  -f <fov>      FOV in degrees (default: 60)\n");
     printf("  --info        Print PLY info and exit\n");
+    printf("  --npu         Enable NPU super-resolution upscale (requires trained .axmodel)\n");
     printf("  --vsync       Enable vsync\n");
     printf("  --dump <dir>  Render from random viewpoints, save as JPEG, then exit\n");
     printf("  -n <count>    Number of dump frames (default: 8)\n");
@@ -75,6 +76,7 @@ int main(int argc, char *argv[]) {
     float fov = 60.0f;
     bool info_only = false;
     bool vsync = false;
+    bool use_npu = false;
     int dump_count = 8;
 
     for (int i = 1; i < argc; i++) {
@@ -94,6 +96,8 @@ int main(int argc, char *argv[]) {
             info_only = true;
         } else if (strcmp(argv[i], "--vsync") == 0) {
             vsync = true;
+        } else if (strcmp(argv[i], "--npu") == 0) {
+            use_npu = true;
         } else if (strcmp(argv[i], "--dump") == 0 && i+1 < argc) {
             dump_dir = argv[++i];
         } else if (argv[i][0] != '-') {
@@ -141,7 +145,7 @@ int main(int argc, char *argv[]) {
     // Initialize renderer (at render resolution)
     Renderer renderer;
     renderer.display.fb_vsync = vsync;
-    if (!gs_renderer_init(renderer, render_w, render_h, headless)) {
+    if (!gs_renderer_init(renderer, render_w, render_h, headless, use_npu)) {
         fprintf(stderr, "Failed to initialize renderer\n");
         gs_scene_free(scene);
         if (!headless) gs_sys_deinit();
@@ -357,7 +361,13 @@ int main(int argc, char *argv[]) {
 
         if (frame_count % 30 == 0) {
             float avg_fps = fps_accum / 30.0f;
-            if (stats.mau_tiles > 0) {
+            if (stats.time_upscale_ms > 0) {
+                printf("\rFPS: %.1f | Visible: %u/%u | Proj: %.1fms Sort: %.1fms Rast: %.1fms NPU: %.1fms Total: %.1fms | Tiles: %u  ",
+                       avg_fps, stats.num_visible, scene.num_gaussians,
+                       stats.time_project_ms, stats.time_sort_ms,
+                       stats.time_raster_ms, stats.time_upscale_ms,
+                       stats.time_total_ms, stats.num_tiles_active);
+            } else if (stats.mau_tiles > 0) {
                 printf("\rFPS: %.1f | Visible: %u/%u | Proj: %.1fms Sort: %.1fms Rast: %.1fms Total: %.1fms | Tiles: %u (MAU:%u CPU:%u)  ",
                        avg_fps, stats.num_visible, scene.num_gaussians,
                        stats.time_project_ms, stats.time_sort_ms,

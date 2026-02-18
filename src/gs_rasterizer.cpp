@@ -723,10 +723,11 @@ static void *raster_thread_func(void *arg) {
 
         uint32_t tx = t % tiles_x;
         uint32_t ty = t / tiles_x;
+        uint32_t tile_count = a->ctx->tiles[t].count;
 
-        // Hybrid dispatch: use MAU path for dense tiles, CPU path for sparse
+        // Dispatch priority: MAU > CPU
         if (a->mau_ctx && a->mau_ctx->initialized &&
-            a->ctx->tiles[t].count >= a->mau_ctx->tile_threshold) {
+            tile_count >= a->mau_ctx->tile_threshold) {
             rasterize_tile_mau(a->ctx->tiles[t], a->gaussians,
                               a->fb->data, a->fb->stride,
                               tx, ty, a->fb->width, a->fb->height,
@@ -748,7 +749,8 @@ static void *raster_thread_func(void *arg) {
 void gs_rasterize(const RasterContext &ctx, const ProjectedGaussian *gaussians,
                   Framebuffer &fb, uint32_t bg_color,
                   MAUContext *mau_ctx,
-                  uint32_t *out_mau_tiles, uint32_t *out_cpu_tiles) {
+                  uint32_t *out_mau_tiles,
+                  uint32_t *out_cpu_tiles) {
     if (!ctx.allocated || ctx.num_tiles == 0) return;
 
     pthread_t threads[NUM_RENDER_THREADS];

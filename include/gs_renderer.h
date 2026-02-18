@@ -3,6 +3,7 @@
 #include "gs_types.h"
 #include "gs_projector.h"
 #include "gs_rasterizer.h"
+#include "gs_npu.h"
 #include "gs_mau.h"
 #include "gs_display.h"
 #include "gs_camera.h"
@@ -11,6 +12,7 @@ struct Renderer {
     ProjectionResult projection;
     ProjectionBatch proj_batch;
     RasterContext raster;
+    NPUContext npu;
     MAUContext mau;
     Framebuffer framebuffers[2];
     Framebuffer upscale_fb;
@@ -25,7 +27,8 @@ struct Renderer {
 
 // Initialize renderer (display, framebuffers, raster context)
 // headless=true skips display init (for dump mode without AX_SYS)
-bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headless = false);
+// use_npu=true enables NPU super-resolution upscale (requires trained .axmodel)
+bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headless = false, bool use_npu = false);
 void gs_renderer_deinit(Renderer &r);
 
 // Render one frame: project → sort → rasterize → display

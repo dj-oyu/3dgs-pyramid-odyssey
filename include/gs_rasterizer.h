@@ -21,8 +21,10 @@ void gs_raster_free(RasterContext &ctx);
 void gs_raster_assign_tiles(RasterContext &ctx, const ProjectedGaussian *gaussians, uint32_t count);
 
 // Rasterize tiles into framebuffer (multi-threaded, NEON alpha compositing)
-// mau_ctx: optional MAU acceleration context (nullptr to use CPU-only path)
+// mau_ctx: optional MAU acceleration context (nullptr to skip)
+// Dispatch priority: MAU > CPU
 void gs_rasterize(const RasterContext &ctx, const ProjectedGaussian *gaussians,
                   Framebuffer &fb, uint32_t bg_color = 0xFF000000,
                   MAUContext *mau_ctx = nullptr,
-                  uint32_t *out_mau_tiles = nullptr, uint32_t *out_cpu_tiles = nullptr);
+                  uint32_t *out_mau_tiles = nullptr,
+                  uint32_t *out_cpu_tiles = nullptr);

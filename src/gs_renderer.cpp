@@ -10,7 +10,7 @@ static double get_time_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headless) {
+bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headless, bool use_npu) {
     if (!headless) {
         // Initialize display (uses its own default resolution from DisplayContext)
         if (!gs_display_init(r.display)) {
@@ -34,10 +34,25 @@ bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headles
     }
     r.current_fb = 0;
 
-    if (!headless && width != r.display.width && height != r.display.height) {
+    if (!headless && (width != r.display.width || height != r.display.height)) {
         r.needs_upscale = true;
-        printf("[gs_renderer] Upscale: %ux%u -> %ux%u (in display layer)\n",
+        printf("[gs_renderer] Upscale: %ux%u -> %ux%u\n",
                width, height, r.display.width, r.display.height);
+
+        // Try NPU super-resolution (only if explicitly requested)
+        if (use_npu && gs_npu_init(r.npu, "data/models/espcn_x2.axmodel")) {
+            // Allocate upscale framebuffer at display resolution (needs phys for VO)
+            bool up_phys = (r.display.backend == DisplayBackend::VO);
+            if (!gs_framebuffer_alloc(r.upscale_fb, r.display.width, r.display.height, up_phys)) {
+                fprintf(stderr, "[gs_renderer] Upscale framebuffer alloc failed, NPU disabled\n");
+                gs_npu_deinit(r.npu);
+            } else {
+                printf("[gs_renderer] NPU super-resolution enabled (%ux%u -> %ux%u)\n",
+                       width, height, r.display.width, r.display.height);
+            }
+        } else {
+            printf("[gs_renderer] NPU unavailable, using display-layer upscale\n");
+        }
     }
 
     // Allocate raster context
@@ -62,7 +77,9 @@ bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headles
 void gs_renderer_deinit(Renderer &r) {
     if (!r.initialized) return;
 
+    gs_npu_deinit(r.npu);
     gs_mau_deinit(r.mau);
+    if (r.upscale_fb.data) gs_framebuffer_free(r.upscale_fb);
     gs_projection_free(r.projection);
     gs_projection_batch_free(r.proj_batch);
     gs_raster_free(r.raster);
@@ -134,8 +151,19 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
                  &mau_tiles, &cpu_tiles);
     double t_raster_end = get_time_ms();
 
-    // 5. Send to display (upscale handled by display layer if needed)
-    gs_display_send_frame(r.display, fb);
+    // 5. NPU super-resolution upscale (if available), then display
+    double t_upscale_start = get_time_ms();
+    if (r.needs_upscale && r.npu.initialized) {
+        if (gs_npu_upscale(r.npu, fb, r.upscale_fb)) {
+            gs_display_send_frame(r.display, r.upscale_fb);
+        } else {
+            // Fallback: send render_fb directly (display layer handles upscale)
+            gs_display_send_frame(r.display, fb);
+        }
+    } else {
+        gs_display_send_frame(r.display, fb);
+    }
+    double t_upscale_end = get_time_ms();
 
     // Swap framebuffers
     r.current_fb = 1 - r.current_fb;
@@ -153,6 +181,8 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
     r.stats.time_cov_ms = (float)(t_cov_end - t_cov_start);
     r.stats.time_color_ms = (float)(t_color_end - t_color_start);
     r.stats.time_assemble_ms = (float)(t_asm_end - t_asm_start);
+    r.stats.time_upscale_ms = (r.needs_upscale && r.npu.initialized)
+                              ? (float)(t_upscale_end - t_upscale_start) : 0.0f;
     r.stats.mau_tiles = mau_tiles;
     r.stats.cpu_tiles = cpu_tiles;
 

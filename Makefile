@@ -8,7 +8,7 @@ CFLAGS   = -O3 -march=armv8.2-a+fp16+dotprod -mtune=cortex-a55 \
 
 INCLUDES = -Iinclude -Iinclude/ax_sdk
 LDFLAGS  = -L/soc/lib -Wl,-rpath,/soc/lib
-LIBS     = -lax_sys -lax_vo -lax_ivps -lax_ive -lpthread -lm
+LIBS     = -lax_sys -lax_vo -lax_ivps -lax_ive -lax_engine -lpthread -lm
 
 SRCDIR   = src
 TOOLDIR  = tools
@@ -26,7 +26,8 @@ SRCS = $(SRCDIR)/main.cpp \
        $(SRCDIR)/gs_memory.cpp \
        $(SRCDIR)/gs_math.cpp \
        $(SRCDIR)/gs_sort.cpp \
-       $(SRCDIR)/gs_mau.cpp
+       $(SRCDIR)/gs_mau.cpp \
+       $(SRCDIR)/gs_npu.cpp
 
 OBJS = $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(SRCS))
 
@@ -36,7 +37,7 @@ LIB_OBJS = $(filter-out $(BUILDDIR)/main.o,$(OBJS))
 TARGET = gs_splat
 
 # Tool targets
-TOOLS = $(BUILDDIR)/vo_test $(BUILDDIR)/ply_info $(BUILDDIR)/vo_diag $(BUILDDIR)/gen_test_ply $(BUILDDIR)/mau_bench $(BUILDDIR)/hw_probe
+TOOLS = $(BUILDDIR)/vo_test $(BUILDDIR)/ply_info $(BUILDDIR)/vo_diag $(BUILDDIR)/gen_test_ply $(BUILDDIR)/mau_bench $(BUILDDIR)/hw_probe $(BUILDDIR)/npu_upscale_bench
 
 .PHONY: all clean tools
 
@@ -76,7 +77,11 @@ $(BUILDDIR)/mau_bench: $(TOOLDIR)/mau_bench.cpp $(BUILDDIR)/gs_memory.o
 	@echo "Built: $@"
 
 $(BUILDDIR)/hw_probe: $(TOOLDIR)/hw_probe.cpp $(BUILDDIR)/gs_memory.o
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $^ $(LIBS) -lax_engine
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $^ $(LIBS)
+	@echo "Built: $@"
+
+$(BUILDDIR)/npu_upscale_bench: $(TOOLDIR)/npu_upscale_bench.cpp $(BUILDDIR)/gs_memory.o $(BUILDDIR)/gs_npu.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $^ $(LIBS)
 	@echo "Built: $@"
 
 clean:
