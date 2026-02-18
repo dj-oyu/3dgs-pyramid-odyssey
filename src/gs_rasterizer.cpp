@@ -57,6 +57,10 @@ void gs_raster_assign_tiles(RasterContext &ctx, const ProjectedGaussian *gaussia
     for (uint32_t gi = 0; gi < count; gi++) {
         const ProjectedGaussian &pg = gaussians[gi];
 
+        // Early reject tiny/transparent Gaussians
+        if (pg.radius < 0.5f) continue;
+        if (pg.opacity < ALPHA_THRESHOLD) continue;
+
         // Compute tile range from bounding circle
         int min_tx = std::max(0, (int)floorf((pg.screen_x - pg.radius) / TILE_SIZE));
         int max_tx = std::min((int)tiles_x - 1, (int)floorf((pg.screen_x + pg.radius) / TILE_SIZE));
@@ -226,8 +230,8 @@ static void rasterize_tile_mau(const TileGaussians &tile,
             }
         }
 
-        // Tile-level transmittance saturation check (every 8 Gaussians)
-        if ((ki & 7u) == 7u) {
+        // Tile-level transmittance saturation check (every 4 Gaussians)
+        if ((ki & 3u) == 3u) {
             bool tile_saturated = true;
             for (uint32_t y = 0; y < TILE_SIZE && tile_saturated; y++)
                 for (uint32_t x = 0; x < TILE_SIZE; x += 4) {
@@ -390,6 +394,18 @@ static void rasterize_tile(const TileGaussians &tile,
     // Half-diagonal of tile (conservative margin for tile extent)
     static constexpr float TILE_MARGIN = TILE_SIZE * 0.7071f;  // sqrt(2)/2 * TILE_SIZE
 
+    // Loop-invariant NEON constants (hoisted out of per-Gaussian loop)
+    float32x4_t v_trans_min = vdupq_n_f32(TRANSMITTANCE_MIN);
+    float32x4_t v_one = vdupq_n_f32(1.0f);
+    float32x4_t v_min_alpha = vdupq_n_f32(ALPHA_THRESHOLD);
+    float32x4_t v_power_max = vdupq_n_f32(4.0f);
+    float32x4_t v_step4 = {0.0f, 1.0f, 2.0f, 3.0f};
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+    float16x8_t v_power_max_h = vdupq_n_f16((__fp16)4.0f);
+    float16x8_t v_step8_h = {(__fp16)0.0f, (__fp16)1.0f, (__fp16)2.0f, (__fp16)3.0f,
+                              (__fp16)4.0f, (__fp16)5.0f, (__fp16)6.0f, (__fp16)7.0f};
+#endif
+
     // Process Gaussians front-to-back (already sorted)
     for (uint32_t gi = 0; gi < tile.count; gi++) {
         // Prefetch next Gaussian data to hide memory latency
@@ -432,24 +448,15 @@ static void rasterize_tile(const TileGaussians &tile,
         float cg = pg.color_g * alpha;
         float cb = pg.color_b * alpha;
 
-        // FP32 NEON vectors (used by both FP16 and FP32 paths)
+        // Per-Gaussian NEON vectors
         float32x4_t v_cr = vdupq_n_f32(cr);
         float32x4_t v_cg = vdupq_n_f32(cg);
         float32x4_t v_cb = vdupq_n_f32(cb);
         float32x4_t v_alpha = vdupq_n_f32(alpha);
-        float32x4_t v_trans_min = vdupq_n_f32(TRANSMITTANCE_MIN);
-        float32x4_t v_one = vdupq_n_f32(1.0f);
-        float32x4_t v_min_alpha = vdupq_n_f32(ALPHA_THRESHOLD);
         float32x4_t v_ha = vdupq_n_f32(ha);
-        float32x4_t v_power_max = vdupq_n_f32(4.0f);
-        float32x4_t v_step4 = {0.0f, 1.0f, 2.0f, 3.0f};
 
 #ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-        // FP16 NEON vectors for 8-wide inner loop
         float16x8_t v_ha_h = vdupq_n_f16((__fp16)ha);
-        float16x8_t v_power_max_h = vdupq_n_f16((__fp16)4.0f);
-        float16x8_t v_step8_h = {(__fp16)0.0f, (__fp16)1.0f, (__fp16)2.0f, (__fp16)3.0f,
-                                  (__fp16)4.0f, (__fp16)5.0f, (__fp16)6.0f, (__fp16)7.0f};
 #endif
 
         for (uint32_t py = g_py0; py < g_py1; py++) {
@@ -610,8 +617,8 @@ static void rasterize_tile(const TileGaussians &tile,
             }
         }
 
-        // Opt-R4: Tile-level transmittance saturation check (every 8 Gaussians)
-        if ((gi & 7u) == 7u) {
+        // Opt-R4: Tile-level transmittance saturation check (every 4 Gaussians)
+        if ((gi & 3u) == 3u) {
             bool tile_saturated = true;
             for (uint32_t y = 0; y < TILE_SIZE && tile_saturated; y++)
                 for (uint32_t x = 0; x < TILE_SIZE; x += 4) {
@@ -704,11 +711,12 @@ static void *raster_thread_func(void *arg) {
             uint32_t px_end = std::min(px_start + TILE_SIZE, a->fb->width);
             uint32_t py_end = std::min(py_start + TILE_SIZE, a->fb->height);
 
+            uint32x4_t bg_vec = vdupq_n_u32(a->bg_color);
             for (uint32_t py = py_start; py < py_end; py++) {
                 uint32_t *row = reinterpret_cast<uint32_t*>(a->fb->data + py * a->fb->stride);
-                for (uint32_t px = px_start; px < px_end; px++) {
-                    row[px] = a->bg_color;
-                }
+                uint32_t px = px_start;
+                for (; px + 4 <= px_end; px += 4) vst1q_u32(&row[px], bg_vec);
+                for (; px < px_end; px++) row[px] = a->bg_color;
             }
             continue;
         }

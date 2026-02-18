@@ -17,7 +17,7 @@ void gs_radix_sort_by_depth(ProjectedGaussian *gaussians, uint32_t count) {
     if (count <= 1) return;
 
     // For small arrays, use insertion sort
-    if (count <= 64) {
+    if (count <= 128) {
         for (uint32_t i = 1; i < count; i++) {
             ProjectedGaussian key = gaussians[i];
             int j = (int)i - 1;

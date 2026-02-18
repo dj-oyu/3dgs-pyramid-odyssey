@@ -364,6 +364,9 @@ uint32_t gs_project_cov(const GaussianScene &scene, const CameraParams &cam,
         float sx = focal_x * vx * inv_z + half_w;
         float sy = focal_y * vy * inv_z + half_h;
 
+        // Early opacity cull before expensive covariance math
+        if (scene.opacity[idx] < ALPHA_THRESHOLD) continue;
+
         // Compute 3D covariance from quaternion + scale
         float cov3d[6];
         compute_cov3d(scene.rot_w[idx], scene.rot_x[idx],
