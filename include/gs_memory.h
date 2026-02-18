@@ -16,7 +16,12 @@ void gs_sys_deinit();
 
 // Allocate contiguous memory via CMM
 bool gs_cmm_alloc(CmmBuffer &buf, uint32_t size, const char *tag);
+bool gs_cmm_alloc_cached(CmmBuffer &buf, uint32_t size, const char *tag);
 void gs_cmm_free(CmmBuffer &buf);
+
+// Cache maintenance for cached CMM buffers
+// Call after DMA writes (e.g., NPU output) to ensure CPU sees fresh data
+void gs_cmm_invalidate_cache(CmmBuffer &buf);
 
 // Allocate aligned float arrays from CMM (16-byte aligned for NEON)
 float *gs_cmm_alloc_floats(uint32_t count, const char *tag, uint64_t *phys_out = nullptr);

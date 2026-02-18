@@ -37,6 +37,27 @@ bool gs_cmm_alloc(CmmBuffer &buf, uint32_t size, const char *tag) {
     return true;
 }
 
+bool gs_cmm_alloc_cached(CmmBuffer &buf, uint32_t size, const char *tag) {
+    AX_U64 phys = 0;
+    AX_VOID *virt = nullptr;
+    AX_S32 ret = AX_SYS_MemAllocCached(&phys, &virt, size, 4096,
+                                         reinterpret_cast<const AX_S8*>(tag));
+    if (ret != 0) {
+        fprintf(stderr, "[gs_memory] AX_SYS_MemAllocCached(%u, %s) failed: 0x%08x\n", size, tag, ret);
+        return false;
+    }
+    buf.virt_addr = virt;
+    buf.phys_addr = phys;
+    buf.size = size;
+    return true;
+}
+
+void gs_cmm_invalidate_cache(CmmBuffer &buf) {
+    if (buf.virt_addr && buf.phys_addr && buf.size) {
+        AX_SYS_MinvalidateCache(buf.phys_addr, buf.virt_addr, buf.size);
+    }
+}
+
 void gs_cmm_free(CmmBuffer &buf) {
     if (buf.virt_addr && buf.phys_addr) {
         AX_SYS_MemFree(buf.phys_addr, buf.virt_addr);
