@@ -15,7 +15,7 @@ static constexpr uint32_t NUM_TILES      = TILES_X * TILES_Y;
 static constexpr float ALPHA_THRESHOLD   = 1.0f / 255.0f;
 static constexpr float TRANSMITTANCE_MIN = 0.003f;
 static constexpr uint32_t MAX_GAUSSIANS_PER_TILE = 4096;
-static constexpr uint32_t NUM_RENDER_THREADS = 4;
+static constexpr uint32_t NUM_RENDER_THREADS = 8;
 
 // SH constants
 static constexpr int MAX_SH_DEGREE = 3;

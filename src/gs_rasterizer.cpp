@@ -250,9 +250,9 @@ static void rasterize_tile_mau(const TileGaussians &tile,
             float det = pg.cov2d_a * pg.cov2d_c - pg.cov2d_b * pg.cov2d_b;
             if (det <= 0.0f) continue;
             float inv_det = 1.0f / det;
-            float inv_a =  pg.cov2d_c * inv_det;
-            float inv_b = -pg.cov2d_b * inv_det;
-            float inv_c =  pg.cov2d_a * inv_det;
+            float ha = 0.5f *  pg.cov2d_c * inv_det;
+            float hb =        -pg.cov2d_b * inv_det;
+            float hc = 0.5f *  pg.cov2d_a * inv_det;
 
             float alpha = pg.opacity;
             float cr = pg.color_r * alpha;
@@ -265,8 +265,8 @@ static void rasterize_tile_mau(const TileGaussians &tile,
             for (uint32_t ly = 0; ly < ly_end; ly++) {
                 float py = (float)(py_start + ly) + 0.5f;
                 float dy = py - pg.screen_y;
-                float dy_sq_term = inv_c * dy * dy;
-                float dy_cross_term = 2.0f * inv_b * dy;
+                float dy_sq_term = hc * dy * dy;
+                float dy_cross_term = hb * dy;
 
                 for (uint32_t lx = 0; lx < lx_end; lx++) {
                     float T = tile_T[ly][lx];
@@ -274,7 +274,7 @@ static void rasterize_tile_mau(const TileGaussians &tile,
 
                     float px = (float)(px_start + lx) + 0.5f;
                     float dx = px - pg.screen_x;
-                    float power = 0.5f * (inv_a*dx*dx + dy_cross_term*dx + dy_sq_term);
+                    float power = ha*dx*dx + dy_cross_term*dx + dy_sq_term;
                     if (power > 4.0f) continue;
 
                     float gauss = expf(-power);
@@ -291,28 +291,61 @@ static void rasterize_tile_mau(const TileGaussians &tile,
         }
     }
 
-    // Write tile to framebuffer (ARGB8888)
-    uint8_t bg_r_val = (bg_color >> 16) & 0xFF;
-    uint8_t bg_g_val = (bg_color >> 8)  & 0xFF;
-    uint8_t bg_b_val =  bg_color        & 0xFF;
+    // Write tile to framebuffer (ARGB8888) — NEON 4-pixel vectorized
+    {
+        float32x4_t v_bg_r = vdupq_n_f32((float)((bg_color >> 16) & 0xFF) / 255.0f);
+        float32x4_t v_bg_g = vdupq_n_f32((float)((bg_color >> 8)  & 0xFF) / 255.0f);
+        float32x4_t v_bg_b = vdupq_n_f32((float)( bg_color        & 0xFF) / 255.0f);
+        float32x4_t v_255  = vdupq_n_f32(255.0f);
+        float32x4_t v_zero = vdupq_n_f32(0.0f);
+        uint32x4_t  v_alpha_byte = vdupq_n_u32(0xFF000000u);
 
-    for (uint32_t py = py_start; py < py_end; py++) {
-        uint32_t ly = py - py_start;
-        uint32_t *row = reinterpret_cast<uint32_t*>(fb_data + py * fb_stride);
+        for (uint32_t py = py_start; py < py_end; py++) {
+            uint32_t ly = py - py_start;
+            uint32_t *row = reinterpret_cast<uint32_t*>(fb_data + py * fb_stride);
 
-        for (uint32_t px = px_start; px < px_end; px++) {
-            uint32_t lx = px - px_start;
-            float T = tile_T[ly][lx];
+            uint32_t px = px_start;
+            for (; px + 4 <= px_end; px += 4) {
+                uint32_t lx = px - px_start;
 
-            float r = tile_r[ly][lx] + T * (bg_r_val / 255.0f);
-            float g = tile_g[ly][lx] + T * (bg_g_val / 255.0f);
-            float b = tile_b[ly][lx] + T * (bg_b_val / 255.0f);
+                float32x4_t v_T = vld1q_f32(&tile_T[ly][lx]);
+                float32x4_t v_r = vld1q_f32(&tile_r[ly][lx]);
+                float32x4_t v_g = vld1q_f32(&tile_g[ly][lx]);
+                float32x4_t v_b = vld1q_f32(&tile_b[ly][lx]);
 
-            uint8_t ri = (uint8_t)std::min(255.0f, std::max(0.0f, r * 255.0f));
-            uint8_t gi = (uint8_t)std::min(255.0f, std::max(0.0f, g * 255.0f));
-            uint8_t bi = (uint8_t)std::min(255.0f, std::max(0.0f, b * 255.0f));
+                v_r = vmlaq_f32(v_r, v_T, v_bg_r);
+                v_g = vmlaq_f32(v_g, v_T, v_bg_g);
+                v_b = vmlaq_f32(v_b, v_T, v_bg_b);
 
-            row[px] = (0xFFu << 24) | ((uint32_t)ri << 16) | ((uint32_t)gi << 8) | bi;
+                v_r = vmaxq_f32(vminq_f32(vmulq_f32(v_r, v_255), v_255), v_zero);
+                v_g = vmaxq_f32(vminq_f32(vmulq_f32(v_g, v_255), v_255), v_zero);
+                v_b = vmaxq_f32(vminq_f32(vmulq_f32(v_b, v_255), v_255), v_zero);
+
+                uint32x4_t u_r = vcvtq_u32_f32(v_r);
+                uint32x4_t u_g = vcvtq_u32_f32(v_g);
+                uint32x4_t u_b = vcvtq_u32_f32(v_b);
+
+                uint32x4_t argb = vorrq_u32(v_alpha_byte,
+                                  vorrq_u32(vshlq_n_u32(u_r, 16),
+                                  vorrq_u32(vshlq_n_u32(u_g, 8), u_b)));
+
+                vst1q_u32(&row[px], argb);
+            }
+
+            for (; px < px_end; px++) {
+                uint32_t lx = px - px_start;
+                float T = tile_T[ly][lx];
+
+                float r = tile_r[ly][lx] + T * ((float)((bg_color >> 16) & 0xFF) / 255.0f);
+                float g = tile_g[ly][lx] + T * ((float)((bg_color >> 8)  & 0xFF) / 255.0f);
+                float b = tile_b[ly][lx] + T * ((float)( bg_color        & 0xFF) / 255.0f);
+
+                uint8_t ri = (uint8_t)std::min(255.0f, std::max(0.0f, r * 255.0f));
+                uint8_t gi_val = (uint8_t)std::min(255.0f, std::max(0.0f, g * 255.0f));
+                uint8_t bi = (uint8_t)std::min(255.0f, std::max(0.0f, b * 255.0f));
+
+                row[px] = (0xFFu << 24) | ((uint32_t)ri << 16) | ((uint32_t)gi_val << 8) | bi;
+            }
         }
     }
 }
@@ -359,24 +392,28 @@ static void rasterize_tile(const TileGaussians &tile,
 
     // Process Gaussians front-to-back (already sorted)
     for (uint32_t gi = 0; gi < tile.count; gi++) {
+        // Prefetch next Gaussian data to hide memory latency
+        if (gi + 1 < tile.count)
+            __builtin_prefetch(&gaussians[tile.indices[gi + 1]], 0, 1);
+
         const ProjectedGaussian &pg = gaussians[tile.indices[gi]];
 
-        // Precompute inverse covariance
+        // Precompute inverse covariance with 0.5 pre-multiplied into a and c
         float det = pg.cov2d_a * pg.cov2d_c - pg.cov2d_b * pg.cov2d_b;
         if (det <= 0.0f) continue;
         float inv_det = 1.0f / det;
-        float inv_a =  pg.cov2d_c * inv_det;
-        float inv_b = -pg.cov2d_b * inv_det;
-        float inv_c =  pg.cov2d_a * inv_det;
+        float ha = 0.5f *  pg.cov2d_c * inv_det;  // 0.5 * inv_a
+        float hb =        -pg.cov2d_b * inv_det;   // inv_b (cross term already has implicit 2x)
+        float hc = 0.5f *  pg.cov2d_a * inv_det;  // 0.5 * inv_c
 
         // Opt-R2: Tile-level Gaussian pre-test
         // Compute Mahalanobis distance at tile center, subtract conservative margin.
         // If the closest possible pixel still has power > 4.0, skip entire Gaussian.
         float tdx = tcx - pg.screen_x;
         float tdy = tcy - pg.screen_y;
-        float tile_power = 0.5f * (inv_a*tdx*tdx + 2.0f*inv_b*tdx*tdy + inv_c*tdy*tdy);
-        float max_inv = fmaxf(inv_a, inv_c);
-        if (tile_power - 0.5f * max_inv * TILE_MARGIN * TILE_MARGIN > 4.0f) continue;
+        float tile_power = ha*tdx*tdx + hb*tdx*tdy + hc*tdy*tdy;
+        float max_hinv = fmaxf(ha, hc);
+        if (tile_power - max_hinv * TILE_MARGIN * TILE_MARGIN > 4.0f) continue;
 
         // Clamp pixel range to Gaussian bounding box within tile
         float rad = pg.radius;
@@ -386,8 +423,8 @@ static void rasterize_tile(const TileGaussians &tile,
         uint32_t g_py1 = std::min(py_end, (uint32_t)ceilf(pg.screen_y + rad));
         if (g_px0 >= g_px1 || g_py0 >= g_py1) continue;
 
-        // Align g_px0 down to 4-pixel boundary (relative to px_start) for NEON
-        uint32_t lx0_aligned = ((g_px0 - px_start) & ~3u);
+        // Align g_px0 down to 8-pixel boundary (relative to px_start) for FP16 NEON
+        uint32_t lx0_aligned = ((g_px0 - px_start) & ~7u);
         g_px0 = px_start + lx0_aligned;
 
         float alpha = pg.opacity;
@@ -395,62 +432,146 @@ static void rasterize_tile(const TileGaussians &tile,
         float cg = pg.color_g * alpha;
         float cb = pg.color_b * alpha;
 
-        // NEON vectors
+        // FP32 NEON vectors (used by both FP16 and FP32 paths)
         float32x4_t v_cr = vdupq_n_f32(cr);
         float32x4_t v_cg = vdupq_n_f32(cg);
         float32x4_t v_cb = vdupq_n_f32(cb);
         float32x4_t v_alpha = vdupq_n_f32(alpha);
-        float32x4_t v_half = vdupq_n_f32(0.5f);
         float32x4_t v_trans_min = vdupq_n_f32(TRANSMITTANCE_MIN);
         float32x4_t v_one = vdupq_n_f32(1.0f);
         float32x4_t v_min_alpha = vdupq_n_f32(ALPHA_THRESHOLD);
-        float32x4_t v_inv_a = vdupq_n_f32(inv_a);
+        float32x4_t v_ha = vdupq_n_f32(ha);
         float32x4_t v_power_max = vdupq_n_f32(4.0f);
-        float32x4_t v_step = {0.0f, 1.0f, 2.0f, 3.0f};
+        float32x4_t v_step4 = {0.0f, 1.0f, 2.0f, 3.0f};
+
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        // FP16 NEON vectors for 8-wide inner loop
+        float16x8_t v_ha_h = vdupq_n_f16((__fp16)ha);
+        float16x8_t v_power_max_h = vdupq_n_f16((__fp16)4.0f);
+        float16x8_t v_step8_h = {(__fp16)0.0f, (__fp16)1.0f, (__fp16)2.0f, (__fp16)3.0f,
+                                  (__fp16)4.0f, (__fp16)5.0f, (__fp16)6.0f, (__fp16)7.0f};
+#endif
 
         for (uint32_t py = g_py0; py < g_py1; py++) {
             float dy = (float)py + 0.5f - pg.screen_y;
-            float dy_sq_term = inv_c * dy * dy;
-            float dy_cross_term = 2.0f * inv_b * dy;
-            float32x4_t v_dy_sq = vdupq_n_f32(dy_sq_term);
-            float32x4_t v_dy_cross = vdupq_n_f32(dy_cross_term);
+            float dy_sq_term = hc * dy * dy;
+            float dy_cross_term = hb * dy;
             uint32_t ly = py - py_start;
 
-            // NEON path: process 4 pixels at a time
             uint32_t px = g_px0;
+
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+            // Tier 1: 8-wide FP16 Mahalanobis + exp, FP32 color accumulation
+            float16x8_t v_dy_sq_h = vdupq_n_f16((__fp16)dy_sq_term);
+            float16x8_t v_dy_cross_h = vdupq_n_f16((__fp16)dy_cross_term);
+
+            for (; px + 8 <= g_px1; px += 8) {
+                uint32_t lx = px - px_start;
+
+                // Load transmittances (2x FP32 loads for 8 pixels)
+                float32x4_t v_T_lo = vld1q_f32(&tile_T[ly][lx]);
+                float32x4_t v_T_hi = vld1q_f32(&tile_T[ly][lx + 4]);
+
+                // Check if all 8 transmittances are below threshold
+                uint32x4_t mask_alive_lo = vcgtq_f32(v_T_lo, v_trans_min);
+                uint32x4_t mask_alive_hi = vcgtq_f32(v_T_hi, v_trans_min);
+                if (vmaxvq_u32(mask_alive_lo) == 0 && vmaxvq_u32(mask_alive_hi) == 0) continue;
+
+                // Compute dx for 8 pixels in FP16
+                float16x8_t v_dx_h = vaddq_f16(vdupq_n_f16((__fp16)((float)px + 0.5f - pg.screen_x)),
+                                                v_step8_h);
+
+                // Mahalanobis distance in FP16: power = ha*dx^2 + hb*dx*dy + hc*dy^2
+                float16x8_t v_power_h = vmulq_f16(v_ha_h, vmulq_f16(v_dx_h, v_dx_h));
+                v_power_h = vfmaq_f16(v_power_h, v_dy_cross_h, v_dx_h);
+                v_power_h = vaddq_f16(v_power_h, v_dy_sq_h);
+
+                // Power cutoff in FP16
+                uint16x8_t mask_power_h = vcltq_f16(v_power_h, v_power_max_h);
+                if (vmaxvq_u16(mask_power_h) == 0) continue;
+
+                // FP16 exp(-power)
+                float16x8_t v_gauss_h = neon_fast_exp_neg_f16(v_power_h);
+
+                // Convert to 2x FP32 for color accumulation
+                float32x4_t v_gauss_lo = vcvt_f32_f16(vget_low_f16(v_gauss_h));
+                float32x4_t v_gauss_hi = vcvt_f32_f16(vget_high_f16(v_gauss_h));
+
+                // Widen power mask to full 32-bit masks (0xFFFF -> 0xFFFFFFFF)
+                uint32x4_t mask_power_lo = vcgtq_u32(vmovl_u16(vget_low_u16(mask_power_h)),
+                                                      vdupq_n_u32(0));
+                uint32x4_t mask_power_hi = vcgtq_u32(vmovl_u16(vget_high_u16(mask_power_h)),
+                                                      vdupq_n_u32(0));
+
+                // -- Process low 4 pixels --
+                float32x4_t v_w_lo = vmulq_f32(v_gauss_lo, v_alpha);
+                uint32x4_t mask_vis_lo = vandq_u32(
+                    vandq_u32(vcgtq_f32(v_w_lo, v_min_alpha), mask_power_lo), mask_alive_lo);
+
+                float32x4_t v_contrib_lo = vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(vmulq_f32(v_T_lo, v_gauss_lo)), mask_vis_lo));
+
+                float32x4_t v_r_lo = vld1q_f32(&tile_r[ly][lx]);
+                float32x4_t v_g_lo = vld1q_f32(&tile_g[ly][lx]);
+                float32x4_t v_b_lo = vld1q_f32(&tile_b[ly][lx]);
+
+                vst1q_f32(&tile_r[ly][lx], vmlaq_f32(v_r_lo, v_contrib_lo, v_cr));
+                vst1q_f32(&tile_g[ly][lx], vmlaq_f32(v_g_lo, v_contrib_lo, v_cg));
+                vst1q_f32(&tile_b[ly][lx], vmlaq_f32(v_b_lo, v_contrib_lo, v_cb));
+
+                float32x4_t v_omw_lo = vsubq_f32(v_one, v_w_lo);
+                v_omw_lo = vbslq_f32(mask_vis_lo, v_omw_lo, v_one);
+                vst1q_f32(&tile_T[ly][lx], vmulq_f32(v_T_lo, v_omw_lo));
+
+                // -- Process high 4 pixels --
+                float32x4_t v_w_hi = vmulq_f32(v_gauss_hi, v_alpha);
+                uint32x4_t mask_vis_hi = vandq_u32(
+                    vandq_u32(vcgtq_f32(v_w_hi, v_min_alpha), mask_power_hi), mask_alive_hi);
+
+                float32x4_t v_contrib_hi = vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(vmulq_f32(v_T_hi, v_gauss_hi)), mask_vis_hi));
+
+                float32x4_t v_r_hi = vld1q_f32(&tile_r[ly][lx + 4]);
+                float32x4_t v_g_hi = vld1q_f32(&tile_g[ly][lx + 4]);
+                float32x4_t v_b_hi = vld1q_f32(&tile_b[ly][lx + 4]);
+
+                vst1q_f32(&tile_r[ly][lx + 4], vmlaq_f32(v_r_hi, v_contrib_hi, v_cr));
+                vst1q_f32(&tile_g[ly][lx + 4], vmlaq_f32(v_g_hi, v_contrib_hi, v_cg));
+                vst1q_f32(&tile_b[ly][lx + 4], vmlaq_f32(v_b_hi, v_contrib_hi, v_cb));
+
+                float32x4_t v_omw_hi = vsubq_f32(v_one, v_w_hi);
+                v_omw_hi = vbslq_f32(mask_vis_hi, v_omw_hi, v_one);
+                vst1q_f32(&tile_T[ly][lx + 4], vmulq_f32(v_T_hi, v_omw_hi));
+            }
+#endif
+
+            // Tier 2: 4-wide FP32 NEON for remaining 4-7 pixels
+            float32x4_t v_dy_sq = vdupq_n_f32(dy_sq_term);
+            float32x4_t v_dy_cross = vdupq_n_f32(dy_cross_term);
+
             for (; px + 4 <= g_px1; px += 4) {
                 uint32_t lx = px - px_start;
 
-                // Load transmittances
                 float32x4_t v_T = vld1q_f32(&tile_T[ly][lx]);
-
-                // Check if all transmittances are below threshold
                 uint32x4_t mask_alive = vcgtq_f32(v_T, v_trans_min);
                 if (vmaxvq_u32(mask_alive) == 0) continue;
 
-                // Compute dx for 4 pixels
                 float base_dx = (float)px + 0.5f - pg.screen_x;
-                float32x4_t v_dx = vaddq_f32(vdupq_n_f32(base_dx), v_step);
+                float32x4_t v_dx = vaddq_f32(vdupq_n_f32(base_dx), v_step4);
 
-                // Mahalanobis distance: 0.5 * (inv_a*dx^2 + 2*inv_b*dx*dy + inv_c*dy^2)
-                float32x4_t v_power = vmulq_f32(v_inv_a, vmulq_f32(v_dx, v_dx));
+                float32x4_t v_power = vmulq_f32(v_ha, vmulq_f32(v_dx, v_dx));
                 v_power = vmlaq_f32(v_power, v_dy_cross, v_dx);
                 v_power = vaddq_f32(v_power, v_dy_sq);
-                v_power = vmulq_f32(v_half, v_power);
 
-                // Opt-R3: NEON power cutoff - skip block if all 4 pixels have power > 4.0
                 uint32x4_t mask_power = vcltq_f32(v_power, v_power_max);
                 if (vmaxvq_u32(mask_power) == 0) continue;
 
-                // Gaussian weight: exp(-power) * alpha
                 float32x4_t v_gauss = neon_fast_exp_neg(v_power);
                 float32x4_t v_w = vmulq_f32(v_gauss, v_alpha);
 
-                // Visibility mask (combine power, alpha threshold, and transmittance)
                 uint32x4_t mask_visible = vandq_u32(
                     vandq_u32(vcgtq_f32(v_w, v_min_alpha), mask_power), mask_alive);
 
-                // Apply: color += T * gauss * (color * opacity)
                 float32x4_t v_contrib = vreinterpretq_f32_u32(
                     vandq_u32(vreinterpretq_u32_f32(vmulq_f32(v_T, v_gauss)), mask_visible));
 
@@ -462,20 +583,19 @@ static void rasterize_tile(const TileGaussians &tile,
                 vst1q_f32(&tile_g[ly][lx], vmlaq_f32(v_g, v_contrib, v_cg));
                 vst1q_f32(&tile_b[ly][lx], vmlaq_f32(v_b, v_contrib, v_cb));
 
-                // Update transmittance: T *= (1 - w) where visible, T unchanged otherwise
                 float32x4_t v_one_minus_w = vsubq_f32(v_one, v_w);
                 v_one_minus_w = vbslq_f32(mask_visible, v_one_minus_w, v_one);
                 vst1q_f32(&tile_T[ly][lx], vmulq_f32(v_T, v_one_minus_w));
             }
 
-            // Handle remaining pixels scalar
+            // Tier 3: Scalar tail for remaining 0-3 pixels
             for (; px < g_px1; px++) {
                 uint32_t lx = px - px_start;
                 float T = tile_T[ly][lx];
                 if (T < TRANSMITTANCE_MIN) continue;
 
                 float dx = (float)px + 0.5f - pg.screen_x;
-                float power = 0.5f * (inv_a*dx*dx + 2.0f*inv_b*dx*dy + inv_c*dy*dy);
+                float power = ha*dx*dx + hb*dx*dy + hc*dy*dy;
                 if (power > 4.0f) continue;
 
                 float gauss = expf(-power);
@@ -505,31 +625,65 @@ static void rasterize_tile(const TileGaussians &tile,
         }
     }
 
-    // Write tile to framebuffer (ARGB8888)
-    uint8_t bg_r = (bg_color >> 16) & 0xFF;
-    uint8_t bg_g = (bg_color >> 8)  & 0xFF;
-    uint8_t bg_b =  bg_color        & 0xFF;
+    // Write tile to framebuffer (ARGB8888) — NEON 4-pixel vectorized
+    float32x4_t v_bg_r = vdupq_n_f32((float)((bg_color >> 16) & 0xFF) / 255.0f);
+    float32x4_t v_bg_g = vdupq_n_f32((float)((bg_color >> 8)  & 0xFF) / 255.0f);
+    float32x4_t v_bg_b = vdupq_n_f32((float)( bg_color        & 0xFF) / 255.0f);
+    float32x4_t v_255  = vdupq_n_f32(255.0f);
+    float32x4_t v_zero = vdupq_n_f32(0.0f);
+    uint32x4_t  v_alpha_byte = vdupq_n_u32(0xFF000000u);
 
     for (uint32_t py = py_start; py < py_end; py++) {
         uint32_t ly = py - py_start;
         uint32_t *row = reinterpret_cast<uint32_t*>(fb_data + py * fb_stride);
 
-        for (uint32_t px = px_start; px < px_end; px++) {
+        // NEON path: 4 pixels at a time
+        uint32_t px = px_start;
+        for (; px + 4 <= px_end; px += 4) {
+            uint32_t lx = px - px_start;
+
+            // Load tile data
+            float32x4_t v_T = vld1q_f32(&tile_T[ly][lx]);
+            float32x4_t v_r = vld1q_f32(&tile_r[ly][lx]);
+            float32x4_t v_g = vld1q_f32(&tile_g[ly][lx]);
+            float32x4_t v_b = vld1q_f32(&tile_b[ly][lx]);
+
+            // Add background: color + T * bg_color
+            v_r = vmlaq_f32(v_r, v_T, v_bg_r);
+            v_g = vmlaq_f32(v_g, v_T, v_bg_g);
+            v_b = vmlaq_f32(v_b, v_T, v_bg_b);
+
+            // Convert to [0,255] and clamp
+            v_r = vmaxq_f32(vminq_f32(vmulq_f32(v_r, v_255), v_255), v_zero);
+            v_g = vmaxq_f32(vminq_f32(vmulq_f32(v_g, v_255), v_255), v_zero);
+            v_b = vmaxq_f32(vminq_f32(vmulq_f32(v_b, v_255), v_255), v_zero);
+
+            // Convert to uint32 and pack ARGB8888
+            uint32x4_t u_r = vcvtq_u32_f32(v_r);
+            uint32x4_t u_g = vcvtq_u32_f32(v_g);
+            uint32x4_t u_b = vcvtq_u32_f32(v_b);
+
+            uint32x4_t argb = vorrq_u32(v_alpha_byte,
+                              vorrq_u32(vshlq_n_u32(u_r, 16),
+                              vorrq_u32(vshlq_n_u32(u_g, 8), u_b)));
+
+            vst1q_u32(&row[px], argb);
+        }
+
+        // Scalar tail for edge tiles
+        for (; px < px_end; px++) {
             uint32_t lx = px - px_start;
             float T = tile_T[ly][lx];
 
-            // Add background contribution
-            float r = tile_r[ly][lx] + T * (bg_r / 255.0f);
-            float g = tile_g[ly][lx] + T * (bg_g / 255.0f);
-            float b = tile_b[ly][lx] + T * (bg_b / 255.0f);
+            float r = tile_r[ly][lx] + T * ((float)((bg_color >> 16) & 0xFF) / 255.0f);
+            float g = tile_g[ly][lx] + T * ((float)((bg_color >> 8)  & 0xFF) / 255.0f);
+            float b = tile_b[ly][lx] + T * ((float)( bg_color        & 0xFF) / 255.0f);
 
-            // Convert to 8-bit
             uint8_t ri = (uint8_t)std::min(255.0f, std::max(0.0f, r * 255.0f));
-            uint8_t gi = (uint8_t)std::min(255.0f, std::max(0.0f, g * 255.0f));
+            uint8_t gi_val = (uint8_t)std::min(255.0f, std::max(0.0f, g * 255.0f));
             uint8_t bi = (uint8_t)std::min(255.0f, std::max(0.0f, b * 255.0f));
 
-            // ARGB8888: Alpha=0xFF
-            row[px] = (0xFFu << 24) | ((uint32_t)ri << 16) | ((uint32_t)gi << 8) | bi;
+            row[px] = (0xFFu << 24) | ((uint32_t)ri << 16) | ((uint32_t)gi_val << 8) | bi;
         }
     }
 }

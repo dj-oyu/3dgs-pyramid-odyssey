@@ -49,6 +49,29 @@ inline float32x4_t neon_fast_exp_neg(float32x4_t x) {
     return vreinterpretq_f32_s32(ival);
 }
 
+// NEON: fast exp(-x) approximation for 8 FP16 values
+// Uses Schraudolph's method adapted for IEEE 754 half-precision.
+// Input x >= 0 (negated internally). ~5% error — acceptable for visualization.
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+inline float16x8_t neon_fast_exp_neg_f16(float16x8_t x) {
+    // Clamp to [0, 4.0] range
+    float16x8_t zero = vdupq_n_f16((__fp16)0.0f);
+    float16x8_t max_val = vdupq_n_f16((__fp16)4.0f);
+    x = vmaxq_f16(x, zero);
+    x = vminq_f16(x, max_val);
+
+    // Schraudolph for FP16: exp(-x) ≈ reinterpret(int16(a - b*x))
+    // FP16: exponent bias=15, mantissa=10 bits
+    // a = 15 * 2^10 = 15360
+    // b = 2^10 / ln(2) ≈ 1477.3
+    float16x8_t b = vdupq_n_f16((__fp16)1477.3f);
+    float16x8_t a = vdupq_n_f16((__fp16)15360.0f);
+    float16x8_t val = vsubq_f16(a, vmulq_f16(b, x));
+    int16x8_t ival = vcvtq_s16_f16(val);
+    return vreinterpretq_f16_s16(ival);
+}
+#endif
+
 // Vector normalize (3-component)
 inline void vec3_normalize(float *v) {
     float len = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
