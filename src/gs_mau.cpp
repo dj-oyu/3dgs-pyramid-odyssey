@@ -87,6 +87,51 @@ bool gs_mau_init(MAUContext &ctx) {
     pthread_mutex_init(&ctx.mau_mutex, nullptr);
 
     ctx.initialized = true;
+
+    // Probe test: run a small MatMul to verify MAU hardware is functional.
+    // AX650C lacks MAU — IVE init succeeds but actual MatMul fails.
+    {
+        auto &tb = ctx.thread_bufs[0];
+        // Use first 8 rows of the existing buffers for a quick 8x6 * 6x256 test
+        tb.g_shape[0] = 8; tb.g_shape[1] = 6;
+        tb.r_shape[0] = 8; tb.r_shape[1] = 256;
+        memset(tb.g_matrix_virt, 0, 8 * 6 * sizeof(float));
+
+        AX_IVE_MAU_MATMUL_INPUT_T probe_in = {};
+        probe_in.stMatQ.u64PhyAddr  = tb.g_matrix_phys;
+        probe_in.stMatQ.pVirAddr    = tb.g_matrix_virt;
+        probe_in.stMatQ.pShape      = tb.g_shape;
+        probe_in.stMatQ.u8ShapeSize = 2;
+        probe_in.stMatQ.enDataType  = AX_IVE_MAU_DT_FLOAT32;
+        probe_in.stMatB.u64PhyAddr  = ctx.pixel_features_phys;
+        probe_in.stMatB.pVirAddr    = ctx.pixel_features_virt;
+        probe_in.stMatB.pShape      = ctx.pixel_features_shape;
+        probe_in.stMatB.u8ShapeSize = 2;
+        probe_in.stMatB.enDataType  = AX_IVE_MAU_DT_FLOAT32;
+
+        AX_IVE_MAU_MATMUL_OUTPUT_T probe_out = {};
+        probe_out.stMulRes.u64PhyAddr  = tb.result_phys;
+        probe_out.stMulRes.pVirAddr    = tb.result_virt;
+        probe_out.stMulRes.pShape      = tb.r_shape;
+        probe_out.stMulRes.u8ShapeSize = 2;
+        probe_out.stMulRes.enDataType  = AX_IVE_MAU_DT_FLOAT32;
+
+        AX_IVE_MAU_MATMUL_CTRL_T probe_ctrl = {};
+        probe_ctrl.enMauId = AX_IVE_MAU_ID_0;
+        probe_ctrl.s32DdrReadBandwidthLimit = -1;
+        probe_ctrl.bEnableMulRes  = AX_TRUE;
+        probe_ctrl.bEnableTopNRes = AX_FALSE;
+
+        AX_IVE_HANDLE h;
+        AX_S32 probe_ret = AX_IVE_MAU_MatMul(&h, &probe_in, &probe_out, &probe_ctrl,
+                                               AX_IVE_ENGINE_MAU, AX_TRUE);
+        if (probe_ret != AX_SUCCESS) {
+            printf("[gs_mau] MAU probe MatMul failed: 0x%08x — hardware not available, disabling\n", probe_ret);
+            gs_mau_deinit(ctx);
+            return false;
+        }
+    }
+
     printf("[gs_mau] MAU context initialized (tile_threshold=%u)\n", ctx.tile_threshold);
     return true;
 }
