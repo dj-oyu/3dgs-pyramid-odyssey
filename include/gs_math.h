@@ -36,7 +36,7 @@ inline float32x4_t neon_fast_exp_neg(float32x4_t x) {
     // Using 4th order Taylor: 1 - x + x^2/2 - x^3/6 + x^4/24
     // But clip to [0, ~7] range for reasonable accuracy
     float32x4_t zero = vdupq_n_f32(0.0f);
-    float32x4_t max_val = vdupq_n_f32(7.0f);
+    float32x4_t max_val = vdupq_n_f32(4.0f);
     x = vmaxq_f32(x, zero);
     x = vminq_f32(x, max_val);
 

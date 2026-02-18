@@ -115,4 +115,9 @@ struct RenderStats {
     float time_raster_ms;
     float time_total_ms;
     float fps;
+    // Per-phase projection timing
+    float time_cull_ms;
+    float time_cov_ms;
+    float time_color_ms;
+    float time_assemble_ms;
 };

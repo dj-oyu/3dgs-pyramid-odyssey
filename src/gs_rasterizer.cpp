@@ -114,6 +114,12 @@ static void rasterize_tile(const TileGaussians &tile,
         for (uint32_t x = 0; x < TILE_SIZE; x++)
             tile_T[y][x] = 1.0f;
 
+    // Tile center for Opt-R2 pre-test
+    float tcx = (float)px_start + TILE_SIZE * 0.5f;
+    float tcy = (float)py_start + TILE_SIZE * 0.5f;
+    // Half-diagonal of tile (conservative margin for tile extent)
+    static constexpr float TILE_MARGIN = TILE_SIZE * 0.7071f;  // sqrt(2)/2 * TILE_SIZE
+
     // Process Gaussians front-to-back (already sorted)
     for (uint32_t gi = 0; gi < tile.count; gi++) {
         const ProjectedGaussian &pg = gaussians[tile.indices[gi]];
@@ -125,6 +131,15 @@ static void rasterize_tile(const TileGaussians &tile,
         float inv_a =  pg.cov2d_c * inv_det;
         float inv_b = -pg.cov2d_b * inv_det;
         float inv_c =  pg.cov2d_a * inv_det;
+
+        // Opt-R2: Tile-level Gaussian pre-test
+        // Compute Mahalanobis distance at tile center, subtract conservative margin.
+        // If the closest possible pixel still has power > 4.0, skip entire Gaussian.
+        float tdx = tcx - pg.screen_x;
+        float tdy = tcy - pg.screen_y;
+        float tile_power = 0.5f * (inv_a*tdx*tdx + 2.0f*inv_b*tdx*tdy + inv_c*tdy*tdy);
+        float max_inv = fmaxf(inv_a, inv_c);
+        if (tile_power - 0.5f * max_inv * TILE_MARGIN * TILE_MARGIN > 4.0f) continue;
 
         // Clamp pixel range to Gaussian bounding box within tile
         float rad = pg.radius;
@@ -153,6 +168,7 @@ static void rasterize_tile(const TileGaussians &tile,
         float32x4_t v_one = vdupq_n_f32(1.0f);
         float32x4_t v_min_alpha = vdupq_n_f32(ALPHA_THRESHOLD);
         float32x4_t v_inv_a = vdupq_n_f32(inv_a);
+        float32x4_t v_power_max = vdupq_n_f32(4.0f);
         float32x4_t v_step = {0.0f, 1.0f, 2.0f, 3.0f};
 
         for (uint32_t py = g_py0; py < g_py1; py++) {
@@ -185,12 +201,17 @@ static void rasterize_tile(const TileGaussians &tile,
                 v_power = vaddq_f32(v_power, v_dy_sq);
                 v_power = vmulq_f32(v_half, v_power);
 
+                // Opt-R3: NEON power cutoff - skip block if all 4 pixels have power > 4.0
+                uint32x4_t mask_power = vcltq_f32(v_power, v_power_max);
+                if (vmaxvq_u32(mask_power) == 0) continue;
+
                 // Gaussian weight: exp(-power) * alpha
                 float32x4_t v_gauss = neon_fast_exp_neg(v_power);
                 float32x4_t v_w = vmulq_f32(v_gauss, v_alpha);
 
-                // Visibility mask
-                uint32x4_t mask_visible = vandq_u32(vcgtq_f32(v_w, v_min_alpha), mask_alive);
+                // Visibility mask (combine power, alpha threshold, and transmittance)
+                uint32x4_t mask_visible = vandq_u32(
+                    vandq_u32(vcgtq_f32(v_w, v_min_alpha), mask_power), mask_alive);
 
                 // Apply: color += T * gauss * (color * opacity)
                 float32x4_t v_contrib = vreinterpretq_f32_u32(
@@ -218,7 +239,7 @@ static void rasterize_tile(const TileGaussians &tile,
 
                 float dx = (float)px + 0.5f - pg.screen_x;
                 float power = 0.5f * (inv_a*dx*dx + 2.0f*inv_b*dx*dy + inv_c*dy*dy);
-                if (power > 7.0f) continue;
+                if (power > 4.0f) continue;
 
                 float gauss = expf(-power);
                 float w = gauss * alpha;
@@ -230,6 +251,20 @@ static void rasterize_tile(const TileGaussians &tile,
                 tile_b[ly][lx] += contrib * cb;
                 tile_T[ly][lx] *= (1.0f - w);
             }
+        }
+
+        // Opt-R4: Tile-level transmittance saturation check (every 8 Gaussians)
+        if ((gi & 7u) == 7u) {
+            bool tile_saturated = true;
+            for (uint32_t y = 0; y < TILE_SIZE && tile_saturated; y++)
+                for (uint32_t x = 0; x < TILE_SIZE; x += 4) {
+                    float32x4_t v_T = vld1q_f32(&tile_T[y][x]);
+                    if (vmaxvq_u32(vcgeq_f32(v_T, vdupq_n_f32(TRANSMITTANCE_MIN))) != 0) {
+                        tile_saturated = false;
+                        break;
+                    }
+                }
+            if (tile_saturated) break;
         }
     }
 

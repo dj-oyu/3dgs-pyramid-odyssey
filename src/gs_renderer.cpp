@@ -58,6 +58,7 @@ void gs_renderer_deinit(Renderer &r) {
     if (!r.initialized) return;
 
     gs_projection_free(r.projection);
+    gs_projection_batch_free(r.proj_batch);
     gs_raster_free(r.raster);
     gs_framebuffer_free(r.framebuffers[0]);
     gs_framebuffer_free(r.framebuffers[1]);
@@ -73,17 +74,41 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
 
     double t_start = get_time_ms();
 
-    // Lazy-allocate projection buffer
+    // Lazy-allocate projection buffer and batch
     if (!r.projection.gaussians) {
         if (!gs_projection_alloc(r.projection, scene.num_gaussians)) {
             fprintf(stderr, "[gs_renderer] Projection alloc failed (%u gaussians)\n", scene.num_gaussians);
             return;
         }
     }
+    if (!r.proj_batch.backing_ptr) {
+        if (!gs_projection_batch_alloc(r.proj_batch, scene.num_gaussians)) {
+            fprintf(stderr, "[gs_renderer] ProjectionBatch alloc failed (%u gaussians)\n", scene.num_gaussians);
+            return;
+        }
+    }
 
-    // 1. Project
+    // 1. Project (phased pipeline with per-phase timing)
     double t_proj_start = get_time_ms();
-    gs_project(scene, cam, r.projection);
+
+    double t_cull_start = get_time_ms();
+    gs_project_cull(scene, cam, r.proj_batch);
+    double t_cull_end = get_time_ms();
+
+    double t_cov_start = get_time_ms();
+    if (r.proj_batch.cull_count > 0)
+        gs_project_cov(scene, cam, r.proj_batch);
+    double t_cov_end = get_time_ms();
+
+    double t_color_start = get_time_ms();
+    if (r.proj_batch.cov_count > 0)
+        gs_project_color(scene, cam, r.proj_batch);
+    double t_color_end = get_time_ms();
+
+    double t_asm_start = get_time_ms();
+    gs_project_assemble(scene, r.proj_batch, r.projection);
+    double t_asm_end = get_time_ms();
+
     double t_proj_end = get_time_ms();
 
     // 2. Sort by depth (front-to-back)
@@ -115,6 +140,10 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
     r.stats.time_raster_ms = (float)(t_raster_end - t_raster_start);
     r.stats.time_total_ms = (float)(t_end - t_start);
     r.stats.fps = (r.stats.time_total_ms > 0) ? 1000.0f / r.stats.time_total_ms : 0.0f;
+    r.stats.time_cull_ms = (float)(t_cull_end - t_cull_start);
+    r.stats.time_cov_ms = (float)(t_cov_end - t_cov_start);
+    r.stats.time_color_ms = (float)(t_color_end - t_color_start);
+    r.stats.time_assemble_ms = (float)(t_asm_end - t_asm_start);
 
     // Count active tiles
     uint32_t active = 0;

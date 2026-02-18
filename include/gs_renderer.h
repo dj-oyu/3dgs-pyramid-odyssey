@@ -8,6 +8,7 @@
 
 struct Renderer {
     ProjectionResult projection;
+    ProjectionBatch proj_batch;
     RasterContext raster;
     Framebuffer framebuffers[2];
     Framebuffer upscale_fb;
