@@ -1,4 +1,5 @@
 #include "gs_rasterizer.h"
+#include "gs_mau.h"
 #include "gs_math.h"
 #include <cstdlib>
 #include <cstring>
@@ -84,6 +85,238 @@ void gs_raster_assign_tiles(RasterContext &ctx, const ProjectedGaussian *gaussia
     }
 }
 
+// Forward declaration for CPU fallback in MAU path
+static void rasterize_tile(const TileGaussians &tile,
+                           const ProjectedGaussian *gaussians,
+                           uint8_t *fb_data, uint32_t fb_stride,
+                           uint32_t tile_x, uint32_t tile_y,
+                           uint32_t fb_width, uint32_t fb_height,
+                           uint32_t bg_color);
+
+// MAU-assisted tile rasterizer: uses precomputed power values from MAU MatMul
+static void rasterize_tile_mau(const TileGaussians &tile,
+                               const ProjectedGaussian *gaussians,
+                               uint8_t *fb_data, uint32_t fb_stride,
+                               uint32_t tile_x, uint32_t tile_y,
+                               uint32_t fb_width, uint32_t fb_height,
+                               uint32_t bg_color,
+                               MAUContext &mau_ctx,
+                               MAUContext::ThreadBuf &tbuf) {
+    uint32_t px_start = tile_x * TILE_SIZE;
+    uint32_t py_start = tile_y * TILE_SIZE;
+    uint32_t px_end = std::min(px_start + TILE_SIZE, fb_width);
+    uint32_t py_end = std::min(py_start + TILE_SIZE, fb_height);
+
+    uint32_t K = std::min(tile.count, mau_ctx.max_k);
+
+    // Phase A: Build G_T[K, 6] on CPU
+    float tile_ox = (float)px_start;
+    float tile_oy = (float)py_start;
+    gs_mau_build_g_matrix(tbuf.g_matrix_virt, gaussians, tile.indices, K,
+                          tile_ox, tile_oy);
+
+    // Phase B: MAU MatMul → Power[K, 256]
+    if (!gs_mau_matmul(mau_ctx, tbuf, K)) {
+        // MAU failed — fall back to CPU rasterizer for this tile
+        rasterize_tile(tile, gaussians, fb_data, fb_stride,
+                       tile_x, tile_y, fb_width, fb_height, bg_color);
+        return;
+    }
+
+    // Phase C: NEON sequential alpha compositing using precomputed power values
+    float tile_r[TILE_SIZE][TILE_SIZE] = {};
+    float tile_g[TILE_SIZE][TILE_SIZE] = {};
+    float tile_b[TILE_SIZE][TILE_SIZE] = {};
+    float tile_T[TILE_SIZE][TILE_SIZE];
+    for (uint32_t y = 0; y < TILE_SIZE; y++)
+        for (uint32_t x = 0; x < TILE_SIZE; x++)
+            tile_T[y][x] = 1.0f;
+
+    float32x4_t v_trans_min = vdupq_n_f32(TRANSMITTANCE_MIN);
+    float32x4_t v_one = vdupq_n_f32(1.0f);
+    float32x4_t v_min_alpha = vdupq_n_f32(ALPHA_THRESHOLD);
+    float32x4_t v_power_max = vdupq_n_f32(4.0f);
+
+    for (uint32_t ki = 0; ki < K; ki++) {
+        const ProjectedGaussian &pg = gaussians[tile.indices[ki]];
+
+        // Skip degenerate Gaussians (same as CPU path)
+        float det = pg.cov2d_a * pg.cov2d_c - pg.cov2d_b * pg.cov2d_b;
+        if (det <= 0.0f) continue;
+
+        float alpha = pg.opacity;
+        float cr = pg.color_r * alpha;
+        float cg = pg.color_g * alpha;
+        float cb = pg.color_b * alpha;
+
+        float32x4_t v_cr = vdupq_n_f32(cr);
+        float32x4_t v_cg = vdupq_n_f32(cg);
+        float32x4_t v_cb = vdupq_n_f32(cb);
+        float32x4_t v_alpha = vdupq_n_f32(alpha);
+
+        // Power values for this Gaussian: contiguous row in result matrix
+        float *power_row = &tbuf.result_virt[ki * 256];
+
+        uint32_t ly_end = py_end - py_start;
+        uint32_t lx_end = px_end - px_start;
+
+        for (uint32_t ly = 0; ly < ly_end; ly++) {
+            // Process 4 pixels at a time with NEON
+            uint32_t lx = 0;
+            for (; lx + 4 <= lx_end; lx += 4) {
+                // Load transmittances
+                float32x4_t v_T = vld1q_f32(&tile_T[ly][lx]);
+
+                // Check if all transmittances are below threshold
+                uint32x4_t mask_alive = vcgtq_f32(v_T, v_trans_min);
+                if (vmaxvq_u32(mask_alive) == 0) continue;
+
+                // Load precomputed power values (contiguous in result matrix)
+                float32x4_t v_power = vld1q_f32(&power_row[ly * TILE_SIZE + lx]);
+
+                // Power cutoff
+                uint32x4_t mask_power = vcltq_f32(v_power, v_power_max);
+                // Also skip negative power (shouldn't happen but safety check)
+                mask_power = vandq_u32(mask_power, vcgeq_f32(v_power, vdupq_n_f32(0.0f)));
+                if (vmaxvq_u32(mask_power) == 0) continue;
+
+                // Gaussian weight: exp(-power) * alpha
+                float32x4_t v_gauss = neon_fast_exp_neg(v_power);
+                float32x4_t v_w = vmulq_f32(v_gauss, v_alpha);
+
+                // Visibility mask
+                uint32x4_t mask_visible = vandq_u32(
+                    vandq_u32(vcgtq_f32(v_w, v_min_alpha), mask_power), mask_alive);
+
+                // Apply: color += T * gauss * (color * opacity)
+                float32x4_t v_contrib = vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(vmulq_f32(v_T, v_gauss)), mask_visible));
+
+                float32x4_t v_r = vld1q_f32(&tile_r[ly][lx]);
+                float32x4_t v_g = vld1q_f32(&tile_g[ly][lx]);
+                float32x4_t v_b = vld1q_f32(&tile_b[ly][lx]);
+
+                vst1q_f32(&tile_r[ly][lx], vmlaq_f32(v_r, v_contrib, v_cr));
+                vst1q_f32(&tile_g[ly][lx], vmlaq_f32(v_g, v_contrib, v_cg));
+                vst1q_f32(&tile_b[ly][lx], vmlaq_f32(v_b, v_contrib, v_cb));
+
+                // Update transmittance
+                float32x4_t v_one_minus_w = vsubq_f32(v_one, v_w);
+                v_one_minus_w = vbslq_f32(mask_visible, v_one_minus_w, v_one);
+                vst1q_f32(&tile_T[ly][lx], vmulq_f32(v_T, v_one_minus_w));
+            }
+
+            // Scalar remainder
+            for (; lx < lx_end; lx++) {
+                float T = tile_T[ly][lx];
+                if (T < TRANSMITTANCE_MIN) continue;
+
+                float power = power_row[ly * TILE_SIZE + lx];
+                if (power < 0.0f || power > 4.0f) continue;
+
+                float gauss = expf(-power);
+                float w = gauss * alpha;
+                if (w < ALPHA_THRESHOLD) continue;
+
+                float contrib = T * gauss;
+                tile_r[ly][lx] += contrib * cr;
+                tile_g[ly][lx] += contrib * cg;
+                tile_b[ly][lx] += contrib * cb;
+                tile_T[ly][lx] *= (1.0f - w);
+            }
+        }
+
+        // Tile-level transmittance saturation check (every 8 Gaussians)
+        if ((ki & 7u) == 7u) {
+            bool tile_saturated = true;
+            for (uint32_t y = 0; y < TILE_SIZE && tile_saturated; y++)
+                for (uint32_t x = 0; x < TILE_SIZE; x += 4) {
+                    float32x4_t v_T = vld1q_f32(&tile_T[y][x]);
+                    if (vmaxvq_u32(vcgeq_f32(v_T, vdupq_n_f32(TRANSMITTANCE_MIN))) != 0) {
+                        tile_saturated = false;
+                        break;
+                    }
+                }
+            if (tile_saturated) break;
+        }
+    }
+
+    // Process overflow Gaussians (beyond max_k) with CPU path inline
+    // (unlikely for typical scenes, but handles edge cases)
+    if (tile.count > K) {
+        for (uint32_t gi = K; gi < tile.count; gi++) {
+            const ProjectedGaussian &pg = gaussians[tile.indices[gi]];
+
+            float det = pg.cov2d_a * pg.cov2d_c - pg.cov2d_b * pg.cov2d_b;
+            if (det <= 0.0f) continue;
+            float inv_det = 1.0f / det;
+            float inv_a =  pg.cov2d_c * inv_det;
+            float inv_b = -pg.cov2d_b * inv_det;
+            float inv_c =  pg.cov2d_a * inv_det;
+
+            float alpha = pg.opacity;
+            float cr = pg.color_r * alpha;
+            float cg = pg.color_g * alpha;
+            float cb = pg.color_b * alpha;
+
+            uint32_t ly_end = py_end - py_start;
+            uint32_t lx_end = px_end - px_start;
+
+            for (uint32_t ly = 0; ly < ly_end; ly++) {
+                float py = (float)(py_start + ly) + 0.5f;
+                float dy = py - pg.screen_y;
+                float dy_sq_term = inv_c * dy * dy;
+                float dy_cross_term = 2.0f * inv_b * dy;
+
+                for (uint32_t lx = 0; lx < lx_end; lx++) {
+                    float T = tile_T[ly][lx];
+                    if (T < TRANSMITTANCE_MIN) continue;
+
+                    float px = (float)(px_start + lx) + 0.5f;
+                    float dx = px - pg.screen_x;
+                    float power = 0.5f * (inv_a*dx*dx + dy_cross_term*dx + dy_sq_term);
+                    if (power > 4.0f) continue;
+
+                    float gauss = expf(-power);
+                    float w = gauss * alpha;
+                    if (w < ALPHA_THRESHOLD) continue;
+
+                    float contrib = T * gauss;
+                    tile_r[ly][lx] += contrib * cr;
+                    tile_g[ly][lx] += contrib * cg;
+                    tile_b[ly][lx] += contrib * cb;
+                    tile_T[ly][lx] *= (1.0f - w);
+                }
+            }
+        }
+    }
+
+    // Write tile to framebuffer (ARGB8888)
+    uint8_t bg_r_val = (bg_color >> 16) & 0xFF;
+    uint8_t bg_g_val = (bg_color >> 8)  & 0xFF;
+    uint8_t bg_b_val =  bg_color        & 0xFF;
+
+    for (uint32_t py = py_start; py < py_end; py++) {
+        uint32_t ly = py - py_start;
+        uint32_t *row = reinterpret_cast<uint32_t*>(fb_data + py * fb_stride);
+
+        for (uint32_t px = px_start; px < px_end; px++) {
+            uint32_t lx = px - px_start;
+            float T = tile_T[ly][lx];
+
+            float r = tile_r[ly][lx] + T * (bg_r_val / 255.0f);
+            float g = tile_g[ly][lx] + T * (bg_g_val / 255.0f);
+            float b = tile_b[ly][lx] + T * (bg_b_val / 255.0f);
+
+            uint8_t ri = (uint8_t)std::min(255.0f, std::max(0.0f, r * 255.0f));
+            uint8_t gi = (uint8_t)std::min(255.0f, std::max(0.0f, g * 255.0f));
+            uint8_t bi = (uint8_t)std::min(255.0f, std::max(0.0f, b * 255.0f));
+
+            row[px] = (0xFFu << 24) | ((uint32_t)ri << 16) | ((uint32_t)gi << 8) | bi;
+        }
+    }
+}
+
 // Per-thread rasterization work
 struct RasterThreadArg {
     const RasterContext *ctx;
@@ -92,6 +325,10 @@ struct RasterThreadArg {
     uint32_t tile_start;
     uint32_t tile_end;
     uint32_t bg_color;
+    MAUContext *mau_ctx;     // nullptr if MAU unavailable
+    uint32_t thread_id;
+    uint32_t mau_tile_count; // output: tiles processed by MAU path
+    uint32_t cpu_tile_count; // output: tiles processed by CPU path
 };
 
 static void rasterize_tile(const TileGaussians &tile,
@@ -300,6 +537,8 @@ static void rasterize_tile(const TileGaussians &tile,
 static void *raster_thread_func(void *arg) {
     auto *a = static_cast<RasterThreadArg*>(arg);
     uint32_t tiles_x = (a->ctx->render_width + TILE_SIZE - 1) / TILE_SIZE;
+    a->mau_tile_count = 0;
+    a->cpu_tile_count = 0;
 
     for (uint32_t t = a->tile_start; t < a->tile_end; t++) {
         if (a->ctx->tiles[t].count == 0) {
@@ -322,16 +561,32 @@ static void *raster_thread_func(void *arg) {
 
         uint32_t tx = t % tiles_x;
         uint32_t ty = t / tiles_x;
-        rasterize_tile(a->ctx->tiles[t], a->gaussians,
-                       a->fb->data, a->fb->stride,
-                       tx, ty, a->fb->width, a->fb->height,
-                       a->bg_color);
+
+        // Hybrid dispatch: use MAU path for dense tiles, CPU path for sparse
+        if (a->mau_ctx && a->mau_ctx->initialized &&
+            a->ctx->tiles[t].count >= a->mau_ctx->tile_threshold) {
+            rasterize_tile_mau(a->ctx->tiles[t], a->gaussians,
+                              a->fb->data, a->fb->stride,
+                              tx, ty, a->fb->width, a->fb->height,
+                              a->bg_color,
+                              *a->mau_ctx,
+                              a->mau_ctx->thread_bufs[a->thread_id]);
+            a->mau_tile_count++;
+        } else {
+            rasterize_tile(a->ctx->tiles[t], a->gaussians,
+                          a->fb->data, a->fb->stride,
+                          tx, ty, a->fb->width, a->fb->height,
+                          a->bg_color);
+            a->cpu_tile_count++;
+        }
     }
     return nullptr;
 }
 
 void gs_rasterize(const RasterContext &ctx, const ProjectedGaussian *gaussians,
-                  Framebuffer &fb, uint32_t bg_color) {
+                  Framebuffer &fb, uint32_t bg_color,
+                  MAUContext *mau_ctx,
+                  uint32_t *out_mau_tiles, uint32_t *out_cpu_tiles) {
     if (!ctx.allocated || ctx.num_tiles == 0) return;
 
     pthread_t threads[NUM_RENDER_THREADS];
@@ -346,15 +601,25 @@ void gs_rasterize(const RasterContext &ctx, const ProjectedGaussian *gaussians,
         args[t].tile_start = t * tiles_per_thread;
         args[t].tile_end = std::min((t + 1) * tiles_per_thread, ctx.num_tiles);
         args[t].bg_color = bg_color;
+        args[t].mau_ctx = mau_ctx;
+        args[t].thread_id = t;
+        args[t].mau_tile_count = 0;
+        args[t].cpu_tile_count = 0;
 
         if (args[t].tile_start < args[t].tile_end) {
             pthread_create(&threads[t], nullptr, raster_thread_func, &args[t]);
         }
     }
 
+    uint32_t total_mau = 0, total_cpu = 0;
     for (uint32_t t = 0; t < NUM_RENDER_THREADS; t++) {
         if (args[t].tile_start < args[t].tile_end) {
             pthread_join(threads[t], nullptr);
+            total_mau += args[t].mau_tile_count;
+            total_cpu += args[t].cpu_tile_count;
         }
     }
+
+    if (out_mau_tiles) *out_mau_tiles = total_mau;
+    if (out_cpu_tiles) *out_cpu_tiles = total_cpu;
 }

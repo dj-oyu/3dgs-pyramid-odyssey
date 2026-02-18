@@ -5,11 +5,14 @@ Real-time 3D Gaussian Splatting renderer for M5Stack AI Pyramid-Pro (AXera AX650
 Renders 3DGS scenes loaded from PLY files, outputting to HDMI via AX_VO API.
 
 ## Hardware Target
-- **SoC**: AXera AX650x (AI Pyramid-Pro)
-- **CPU**: ARM Cortex-A55 x4 (ARMv8.2-A, NEON/ASIMD, fp16, dotprod)
+- **SoC**: Axera AX8850 (AX650C_CHIP) — 24 TOPS @ INT8
+- **CPU**: ARM Cortex-A55 x8 (ARMv8.2-A, NEON/ASIMD, fp16, dotprod) @ 1500MHz
 - **RAM**: 2GB general + 6GB CMM (contiguous memory manager)
+- **NPU**: 24 TOPS INT8, AX_ENGINE v2.12.0s (VIRTUAL_NPU_DISABLE mode)
+- **MAU**: Not available on AX650C variant
 - **Display**: HDMI up to 4K@60fps via AX_VO API
 - **SDK**: V3.6.4
+- **Details**: See `docs/HARDWARE_REPORT.md`
 
 ## Build
 ```bash
@@ -59,9 +62,11 @@ make clean    # Clean build artifacts
 - `src/gs_display.cpp` - AX_VO HDMI output (with /dev/fb0 fallback)
 - `docs/RENDERING_DEBUG.md` - **Rendering quality debug status and analysis**
 
-## Current Status (2026-02-17)
-Rendering pipeline produces correct output. Root cause was camera placement (too far from
-scene center). See `docs/RENDERING_DEBUG.md` for full debug history.
+## Current Status (2026-02-18)
+Rendering pipeline produces correct output. MAU acceleration code implemented but inactive
+(AX650C lacks MAU hardware). NPU inference engine (AX_ENGINE) confirmed available.
+See `docs/HARDWARE_REPORT.md` for full HW capability analysis.
+See `docs/RENDERING_DEBUG.md` for rendering quality debug history.
 
 ## Test Scenes
 PLY files at `~/ply/`: Mars.ply, Auditorium.ply, InteriorDesign.ply (SH degree 3).

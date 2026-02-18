@@ -25,7 +25,8 @@ SRCS = $(SRCDIR)/main.cpp \
        $(SRCDIR)/gs_display.cpp \
        $(SRCDIR)/gs_memory.cpp \
        $(SRCDIR)/gs_math.cpp \
-       $(SRCDIR)/gs_sort.cpp
+       $(SRCDIR)/gs_sort.cpp \
+       $(SRCDIR)/gs_mau.cpp
 
 OBJS = $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(SRCS))
 
@@ -35,7 +36,7 @@ LIB_OBJS = $(filter-out $(BUILDDIR)/main.o,$(OBJS))
 TARGET = gs_splat
 
 # Tool targets
-TOOLS = $(BUILDDIR)/vo_test $(BUILDDIR)/ply_info $(BUILDDIR)/vo_diag $(BUILDDIR)/gen_test_ply
+TOOLS = $(BUILDDIR)/vo_test $(BUILDDIR)/ply_info $(BUILDDIR)/vo_diag $(BUILDDIR)/gen_test_ply $(BUILDDIR)/mau_bench $(BUILDDIR)/hw_probe
 
 .PHONY: all clean tools
 
@@ -68,6 +69,14 @@ $(BUILDDIR)/vo_diag: $(TOOLDIR)/vo_diag.cpp
 
 $(BUILDDIR)/gen_test_ply: $(TOOLDIR)/gen_test_ply.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $< -lm
+	@echo "Built: $@"
+
+$(BUILDDIR)/mau_bench: $(TOOLDIR)/mau_bench.cpp $(BUILDDIR)/gs_memory.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $^ $(LIBS)
+	@echo "Built: $@"
+
+$(BUILDDIR)/hw_probe: $(TOOLDIR)/hw_probe.cpp $(BUILDDIR)/gs_memory.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $^ $(LIBS) -lax_engine
 	@echo "Built: $@"
 
 clean:

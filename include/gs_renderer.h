@@ -3,6 +3,7 @@
 #include "gs_types.h"
 #include "gs_projector.h"
 #include "gs_rasterizer.h"
+#include "gs_mau.h"
 #include "gs_display.h"
 #include "gs_camera.h"
 
@@ -10,6 +11,7 @@ struct Renderer {
     ProjectionResult projection;
     ProjectionBatch proj_batch;
     RasterContext raster;
+    MAUContext mau;
     Framebuffer framebuffers[2];
     Framebuffer upscale_fb;
     int current_fb = 0;

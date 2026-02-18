@@ -49,6 +49,11 @@ bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headles
         return false;
     }
 
+    // Initialize MAU acceleration (non-fatal if unavailable)
+    if (!gs_mau_init(r.mau)) {
+        printf("[gs_renderer] MAU unavailable, using CPU-only rasterizer\n");
+    }
+
     r.initialized = true;
     printf("[gs_renderer] Renderer initialized: %ux%u\n", width, height);
     return true;
@@ -57,6 +62,7 @@ bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headles
 void gs_renderer_deinit(Renderer &r) {
     if (!r.initialized) return;
 
+    gs_mau_deinit(r.mau);
     gs_projection_free(r.projection);
     gs_projection_batch_free(r.proj_batch);
     gs_raster_free(r.raster);
@@ -122,7 +128,10 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
     // 4. Rasterize into current framebuffer
     double t_raster_start = get_time_ms();
     Framebuffer &fb = r.framebuffers[r.current_fb];
-    gs_rasterize(r.raster, r.projection.gaussians, fb, 0xFF000000);
+    uint32_t mau_tiles = 0, cpu_tiles = 0;
+    gs_rasterize(r.raster, r.projection.gaussians, fb, 0xFF000000,
+                 r.mau.initialized ? &r.mau : nullptr,
+                 &mau_tiles, &cpu_tiles);
     double t_raster_end = get_time_ms();
 
     // 5. Send to display (upscale handled by display layer if needed)
@@ -144,6 +153,8 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
     r.stats.time_cov_ms = (float)(t_cov_end - t_cov_start);
     r.stats.time_color_ms = (float)(t_color_end - t_color_start);
     r.stats.time_assemble_ms = (float)(t_asm_end - t_asm_start);
+    r.stats.mau_tiles = mau_tiles;
+    r.stats.cpu_tiles = cpu_tiles;
 
     // Count active tiles
     uint32_t active = 0;

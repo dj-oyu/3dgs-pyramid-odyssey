@@ -120,4 +120,7 @@ struct RenderStats {
     float time_cov_ms;
     float time_color_ms;
     float time_assemble_ms;
+    // MAU rasterizer stats
+    uint32_t mau_tiles;       // Tiles processed via MAU path
+    uint32_t cpu_tiles;       // Tiles processed via CPU-only path
 };

@@ -357,11 +357,19 @@ int main(int argc, char *argv[]) {
 
         if (frame_count % 30 == 0) {
             float avg_fps = fps_accum / 30.0f;
-            printf("\rFPS: %.1f | Visible: %u/%u | Proj: %.1fms Sort: %.1fms Rast: %.1fms Total: %.1fms | Tiles: %u  ",
-                   avg_fps, stats.num_visible, scene.num_gaussians,
-                   stats.time_project_ms, stats.time_sort_ms,
-                   stats.time_raster_ms, stats.time_total_ms,
-                   stats.num_tiles_active);
+            if (stats.mau_tiles > 0) {
+                printf("\rFPS: %.1f | Visible: %u/%u | Proj: %.1fms Sort: %.1fms Rast: %.1fms Total: %.1fms | Tiles: %u (MAU:%u CPU:%u)  ",
+                       avg_fps, stats.num_visible, scene.num_gaussians,
+                       stats.time_project_ms, stats.time_sort_ms,
+                       stats.time_raster_ms, stats.time_total_ms,
+                       stats.num_tiles_active, stats.mau_tiles, stats.cpu_tiles);
+            } else {
+                printf("\rFPS: %.1f | Visible: %u/%u | Proj: %.1fms Sort: %.1fms Rast: %.1fms Total: %.1fms | Tiles: %u  ",
+                       avg_fps, stats.num_visible, scene.num_gaussians,
+                       stats.time_project_ms, stats.time_sort_ms,
+                       stats.time_raster_ms, stats.time_total_ms,
+                       stats.num_tiles_active);
+            }
             fflush(stdout);
             fps_accum = 0.0f;
         }
