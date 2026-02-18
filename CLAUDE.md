@@ -57,14 +57,29 @@ make clean    # Clean build artifacts
 ## Key Files
 - `include/gs_types.h` - Core data structures (SoA Gaussians, tiles)
 - `src/gs_projector.cpp` - 3D→2D projection, SH evaluation, Jacobian (most complex file)
-- `src/gs_rasterizer.cpp` - NEON tile-based rasterizer (4-thread, front-to-back)
+- `src/gs_rasterizer.cpp` - NEON tile-based rasterizer (8-thread, front-to-back, MAU > CPU dispatch)
 - `src/gs_renderer.cpp` - Rendering pipeline orchestrator
 - `src/gs_display.cpp` - AX_VO HDMI output (with /dev/fb0 fallback)
+- `include/gs_npu.h` / `src/gs_npu.cpp` - Generic AX_ENGINE wrapper (model-agnostic)
+- `tools/gen_espcn_onnx.py` - Generate ESPCN-x2 super-resolution ONNX model
+- `tools/npu_upscale_bench.cpp` - NPU super-resolution latency benchmark
 - `docs/RENDERING_DEBUG.md` - **Rendering quality debug status and analysis**
 
+## NPU Strategy: Super-Resolution Upscaling
+The NPU MatMul approach for rasterizer acceleration failed (INT8-only NPU, needs float precision).
+Current: use NPU for ESPCN-x2 super-resolution upscaling.
+- Render at 960x540 (`-s 2`), rasterize 4x fewer pixels
+- NPU 2x upscale via ESPCN CNN → 1920x1080 HDMI output
+- Enable with `--npu` flag: `sudo build/gs_splat ~/ply/Mars.ply -s 2 --npu`
+- Pipeline: ARGB→uint8 NCHW (0.5ms) → NPU inference (17ms) → float32→ARGB (14ms) = **~32ms total**
+- Performance: 540p@6.9 FPS → 1080p@5.7 FPS (+30ms for 4x resolution)
+- Current model: bilinear weights (pipeline verification), needs trained ESPCN weights for quality SR
+- Model compiled with pulsar2: `input_processors` for uint8 input, output still float32 NCHW
+- Output CMM buffer uses `AX_SYS_MemAllocCached` + `MinvalidateCache` to avoid uncached DRAM penalty
+
 ## Current Status (2026-02-18)
-Rendering pipeline produces correct output. MAU acceleration code implemented but inactive
-(AX650C lacks MAU hardware). NPU inference engine (AX_ENGINE) confirmed available.
+Rendering pipeline produces correct output. NPU super-resolution upscale pipeline working.
+MAU acceleration code implemented but inactive (AX650C lacks MAU hardware).
 See `docs/HARDWARE_REPORT.md` for full HW capability analysis.
 See `docs/RENDERING_DEBUG.md` for rendering quality debug history.
 

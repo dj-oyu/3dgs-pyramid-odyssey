@@ -1,0 +1,28 @@
+{
+  "model_type": "ONNX",
+  "npu_mode": "NPU1",
+  "quant": {
+    "input_configs": [{
+      "tensorName": "input",
+      "calibrationDataset": "espcn_calibration.tar",
+      "calibrationFormat": "Numpy",
+      "calibrationSize": 32
+    }],
+    "calibration_method": "MinMax"
+  },
+  "input_processors": [{
+    "tensor_name": "DEFAULT",
+    "src_dtype": "U8",
+    "src_layout": "NCHW",
+    "tensor_layout": "NCHW",
+    "mean": [0, 0, 0],
+    "std": [255, 255, 255]
+  }],
+  "output_processors": [{
+    "tensor_name": "DEFAULT",
+    "output_dtype": "U8"
+  }],
+  "compiler": {
+    "check": 0
+  }
+}

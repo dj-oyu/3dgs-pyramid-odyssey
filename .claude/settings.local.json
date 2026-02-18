@@ -44,7 +44,29 @@
       "Bash(timeout:*)",
       "Bash(build/gs_splat:*)",
       "Bash(git rm:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git config:*)",
+      "Bash(sudo /home/admin-user/github/3dgs-pyramid-odyssey/build/gs_splat:*)",
+      "Bash(/home/admin-user/github/3dgs-pyramid-odyssey/build/gs_splat:*)",
+      "Bash(./build/gs_splat:*)",
+      "WebFetch(domain:pulsar2-docs.readthedocs.io)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:docs.m5stack.com)",
+      "Bash(gemini -p \"AXera AX650N \\(M5Stack AI Pyramid Pro\\) の AX_IVE_MAU_MatMul と AX_IVE_NPU_MatMul について教えてください。\n\n知りたいこと:\n1. AX_IVE_MAU_MatMul の具体的な使い方（サンプルコードがあれば）\n2. AX_IVE_NPU_MatMul は pchModelDir にモデルディレクトリが必要とあるが、これは何のモデル？MatMul用の専用.axmodelが必要？\n3. MAUとNPUのMatMulの性能差・制約の違い\n4. Pulsar2でカスタムONNXモデル（行列演算だけのモデル）をコンパイルして.axmodelにする方法\n5. AX650NのNPUでfloat32のMatMulは実行可能か？それともINT8量子化が必須か？\n6. 3D Gaussian SplattingのProjection（3D→2D射影、共分散計算、SH評価）をNPUにオフロードする現実的なアプローチ\n\n日本語で回答してください。\")",
+      "Bash(gemini:*)",
+      "Bash(git push:*)",
+      "Bash(lsmod:*)",
+      "WebFetch(domain:www.axera-tech.com)",
+      "WebFetch(domain:en.axera-tech.com)",
+      "WebFetch(domain:shop.m5stack.com)",
+      "WebFetch(domain:www.cnx-software.com)",
+      "WebFetch(domain:wiki.sipeed.com)",
+      "WebFetch(domain:linuxgizmos.com)",
+      "Bash(gh repo view:*)",
+      "Bash(wc:*)",
+      "Bash(pip3 install:*)",
+      "WebFetch(domain:docs.radxa.com)"
     ]
   }
 }
