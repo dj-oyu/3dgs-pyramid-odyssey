@@ -24,6 +24,7 @@ struct Renderer {
     RenderStats stats = {};
     bool initialized = false;
     int max_sh_degree = MAX_SH_DEGREE;  // Cap SH evaluation (0=DC only, 3=full)
+    uint32_t max_gaussians = 0;         // Cap visible Gaussians after sort (0=unlimited)
 };
 
 // Initialize renderer (display, framebuffers, raster context)

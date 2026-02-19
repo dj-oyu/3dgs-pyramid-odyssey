@@ -54,6 +54,7 @@ static void print_usage(const char *prog) {
     printf("  --sh-degree <N>  Cap SH evaluation degree (0-3, default: 3)\n");
     printf("  --saturation <F>  NPU output saturation boost factor (default: 3.0 with --npu)\n");
     printf("  --bench <N>   Benchmark mode: render N frames with orbit camera, print timing, exit\n");
+    printf("  --max-gaussians <N>  Cap visible Gaussians after sort (for scaling experiments)\n");
     printf("\nControls:\n");
     printf("  WASD       Move camera\n");
     printf("  Q/E        Up/Down\n");
@@ -84,6 +85,7 @@ int main(int argc, char *argv[]) {
     int max_sh_degree = MAX_SH_DEGREE;
     int bench_frames = 0;
     float saturation = -1.0f;  // -1 = auto (3.0 with --npu, 1.0 without)
+    uint32_t max_gaussians = 0; // 0 = unlimited
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-w") == 0 && i+1 < argc) {
@@ -113,6 +115,8 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--saturation") == 0 && i+1 < argc) {
             saturation = atof(argv[++i]);
             if (saturation < 1.0f) saturation = 1.0f;
+        } else if (strcmp(argv[i], "--max-gaussians") == 0 && i+1 < argc) {
+            max_gaussians = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--bench") == 0 && i+1 < argc) {
             bench_frames = atoi(argv[++i]);
             if (bench_frames < 1) bench_frames = 1;
@@ -170,8 +174,12 @@ int main(int argc, char *argv[]) {
     }
 
     renderer.max_sh_degree = max_sh_degree;
+    renderer.max_gaussians = max_gaussians;
     if (max_sh_degree < MAX_SH_DEGREE) {
         printf("[main] SH degree capped: %d (scene has %d)\n", max_sh_degree, MAX_SH_DEGREE);
+    }
+    if (max_gaussians > 0) {
+        printf("[main] Max visible Gaussians capped: %u\n", max_gaussians);
     }
 
     // Set NPU saturation boost (auto: 3.0 with NPU, 1.0 without)
@@ -386,12 +394,15 @@ int main(int argc, char *argv[]) {
         rms_dist = sqrtf(rms_dist / scene.num_gaussians);
         float dist = rms_dist * 1.5f;
 
-        printf("\n=== Benchmark: %d frames, %ux%u, SH degree %d ===\n",
-               bench_frames, render_w, render_h, max_sh_degree);
-        printf("%5s %8s %8s %8s %8s %8s %8s\n",
-               "Frame", "Proj", "Sort", "Raster", "Upscale", "Total", "FPS");
+        printf("\n=== Benchmark: %d frames, %ux%u, SH degree %d%s ===\n",
+               bench_frames, render_w, render_h, max_sh_degree,
+               max_gaussians > 0 ? ", capped" : "");
+        printf("%5s %8s %8s %8s %8s %8s %8s  | %7s %7s %7s %7s\n",
+               "Frame", "Proj", "Sort", "Raster", "Upscale", "Total", "FPS",
+               "Cull", "Cov", "Color", "Asm");
 
         float sum_proj = 0, sum_sort = 0, sum_raster = 0, sum_upscale = 0, sum_total = 0;
+        float sum_cull = 0, sum_cov = 0, sum_color = 0, sum_asm = 0;
 
         for (int fi = 0; fi < bench_frames; fi++) {
             float angle = (float)fi / (float)bench_frames * 2.0f * M_PI;
@@ -413,22 +424,28 @@ int main(int argc, char *argv[]) {
             gs_renderer_render_frame(renderer, scene, cam_params);
 
             const RenderStats &s = gs_renderer_get_stats(renderer);
-            printf("%5d %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f\n",
+            printf("%5d %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f  | %6.1f %6.1f %6.1f %6.1f\n",
                    fi, s.time_project_ms, s.time_sort_ms, s.time_raster_ms,
-                   s.time_upscale_ms, s.time_total_ms, s.fps);
+                   s.time_upscale_ms, s.time_total_ms, s.fps,
+                   s.time_cull_ms, s.time_cov_ms, s.time_color_ms, s.time_assemble_ms);
 
             sum_proj += s.time_project_ms;
             sum_sort += s.time_sort_ms;
             sum_raster += s.time_raster_ms;
             sum_upscale += s.time_upscale_ms;
             sum_total += s.time_total_ms;
+            sum_cull += s.time_cull_ms;
+            sum_cov += s.time_cov_ms;
+            sum_color += s.time_color_ms;
+            sum_asm += s.time_assemble_ms;
         }
 
         float n = (float)bench_frames;
-        printf("──────────────────────────────────────────────────────\n");
-        printf("  AVG %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f\n",
+        printf("──────────────────────────────────────────────────────────────────────────────\n");
+        printf("  AVG %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f  | %6.1f %6.1f %6.1f %6.1f\n",
                sum_proj/n, sum_sort/n, sum_raster/n, sum_upscale/n, sum_total/n,
-               1000.0f / (sum_total/n));
+               1000.0f / (sum_total/n),
+               sum_cull/n, sum_cov/n, sum_color/n, sum_asm/n);
         printf("\nVisible (last frame): %u/%u | Tiles: %u\n",
                renderer.stats.num_visible, scene.num_gaussians,
                renderer.stats.num_tiles_active);

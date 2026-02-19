@@ -149,6 +149,11 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
     gs_radix_sort_by_depth(r.projection.gaussians, r.projection.count);
     double t_sort_end = get_time_ms();
 
+    // 2b. Cap visible Gaussians (for scaling experiments)
+    if (r.max_gaussians > 0 && r.projection.count > r.max_gaussians) {
+        r.projection.count = r.max_gaussians;
+    }
+
     // 3. Assign to tiles
     gs_raster_assign_tiles(r.raster, r.projection.gaussians, r.projection.count);
 
