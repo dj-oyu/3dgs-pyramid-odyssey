@@ -365,15 +365,19 @@ static void argb_to_u8_nchw(const uint8_t *src, uint32_t stride,
 }
 
 // Convert uint8 NCHW planar → ARGB8888 with optional saturation boost.
-// boost_q4: saturation factor in Q4 fixed-point (0 = no boost, 32 = 3.0x factor).
-// Saturation boost compensates INT8 quantization color loss: out_c = luma + factor*(c - luma)
-// Uses BT.601 luma: Y = (77*R + 150*G + 29*B) >> 8
+// Uses G channel as per-pixel luma proxy (R≈G≈B for desaturated NPU INT8 output).
+// G passes through unchanged; only R and B are boosted:
+//   out_r = clamp(r + ((r - g) * boost_q4) >> 4, 0, 255)
+//   out_b = clamp(b + ((b - g) * boost_q4) >> 4, 0, 255)
+// boost_q4 = (saturation_factor - 1) * 16. E.g. factor=4.5 → boost_q4=56.
+// Both paths process 16 pixels/iteration with vst4q_u8 interleaved store.
 static void u8_nchw_to_argb(const uint8_t *src, uint8_t *dst, uint32_t stride,
                              uint32_t width, uint32_t height, int boost_q4) {
     uint32_t plane = width * height;
     const uint8_t *src_r = src;
     const uint8_t *src_g = src + plane;
     const uint8_t *src_b = src + plane * 2;
+    uint8x16_t alpha = vdupq_n_u8(0xFF);
 
     for (uint32_t y = 0; y < height; y++) {
         uint8_t *row = dst + y * stride;
@@ -381,8 +385,7 @@ static void u8_nchw_to_argb(const uint8_t *src, uint8_t *dst, uint32_t stride,
         uint32_t x = 0;
 
         if (boost_q4 == 0) {
-            // Fast path: no saturation boost (16 pixels/iteration)
-            uint8x16_t alpha = vdupq_n_u8(0xFF);
+            // No boost: fast 16-pixel load/store only
             for (; x + 16 <= width; x += 16) {
                 uint8x16x4_t argb;
                 argb.val[0] = vld1q_u8(src_b + offset + x);
@@ -392,45 +395,40 @@ static void u8_nchw_to_argb(const uint8_t *src, uint8_t *dst, uint32_t stride,
                 vst4q_u8(row + x * 4, argb);
             }
         } else {
-            // Saturation boost path (8 pixels/iteration, int16 arithmetic)
+            // G-as-luma saturation boost: 16 pixels/iteration.
+            // G is unchanged. R and B: delta = ((c - g) * boost_q4 + 8) >> 4
             int16x8_t vboost = vdupq_n_s16((int16_t)boost_q4);
-            uint8x8_t alpha8 = vdup_n_u8(0xFF);
-            uint8x8_t w_r = vdup_n_u8(77);   // BT.601 R weight
-            uint8x8_t w_g = vdup_n_u8(150);  // BT.601 G weight
-            uint8x8_t w_b = vdup_n_u8(29);   // BT.601 B weight
 
-            for (; x + 8 <= width; x += 8) {
-                uint8x8_t r8 = vld1_u8(src_r + offset + x);
-                uint8x8_t g8 = vld1_u8(src_g + offset + x);
-                uint8x8_t b8 = vld1_u8(src_b + offset + x);
+            for (; x + 16 <= width; x += 16) {
+                uint8x16_t r = vld1q_u8(src_r + offset + x);
+                uint8x16_t g = vld1q_u8(src_g + offset + x);
+                uint8x16_t b = vld1q_u8(src_b + offset + x);
 
-                // Luma: Y = (77*R + 150*G + 29*B) >> 8
-                uint16x8_t y16 = vmull_u8(r8, w_r);
-                y16 = vmlal_u8(y16, g8, w_g);
-                y16 = vmlal_u8(y16, b8, w_b);
-                int16x8_t luma = vreinterpretq_s16_u16(vshrq_n_u16(y16, 8));
+                // Widen G (shared by R and B boost)
+                int16x8_t g_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(g)));
+                int16x8_t g_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(g)));
 
-                // R: out = clamp(R + ((R - luma) * boost) >> 4, 0, 255)
-                int16x8_t r16 = vreinterpretq_s16_u16(vmovl_u8(r8));
-                int16x8_t out_r = vaddq_s16(r16, vshrq_n_s16(vmulq_s16(vsubq_s16(r16, luma), vboost), 4));
-                uint8x8_t r_out = vqmovun_s16(out_r);
+                // R boost: out_r = r + ((r - g) * boost_q4) >> 4
+                int16x8_t r_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(r)));
+                int16x8_t r_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(r)));
+                r_lo = vaddq_s16(r_lo, vshrq_n_s16(vmulq_s16(vsubq_s16(r_lo, g_lo), vboost), 4));
+                r_hi = vaddq_s16(r_hi, vshrq_n_s16(vmulq_s16(vsubq_s16(r_hi, g_hi), vboost), 4));
+                uint8x16_t r_out = vcombine_u8(vqmovun_s16(r_lo), vqmovun_s16(r_hi));
 
-                // G
-                int16x8_t g16 = vreinterpretq_s16_u16(vmovl_u8(g8));
-                int16x8_t out_g = vaddq_s16(g16, vshrq_n_s16(vmulq_s16(vsubq_s16(g16, luma), vboost), 4));
-                uint8x8_t g_out = vqmovun_s16(out_g);
+                // B boost: out_b = b + ((b - g) * boost_q4) >> 4
+                int16x8_t b_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(b)));
+                int16x8_t b_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(b)));
+                b_lo = vaddq_s16(b_lo, vshrq_n_s16(vmulq_s16(vsubq_s16(b_lo, g_lo), vboost), 4));
+                b_hi = vaddq_s16(b_hi, vshrq_n_s16(vmulq_s16(vsubq_s16(b_hi, g_hi), vboost), 4));
+                uint8x16_t b_out = vcombine_u8(vqmovun_s16(b_lo), vqmovun_s16(b_hi));
 
-                // B
-                int16x8_t b16 = vreinterpretq_s16_u16(vmovl_u8(b8));
-                int16x8_t out_b = vaddq_s16(b16, vshrq_n_s16(vmulq_s16(vsubq_s16(b16, luma), vboost), 4));
-                uint8x8_t b_out = vqmovun_s16(out_b);
-
-                uint8x8x4_t bgra;
-                bgra.val[0] = b_out;
-                bgra.val[1] = g_out;
-                bgra.val[2] = r_out;
-                bgra.val[3] = alpha8;
-                vst4_u8(row + x * 4, bgra);
+                // G passes through unchanged
+                uint8x16x4_t argb;
+                argb.val[0] = b_out;
+                argb.val[1] = g;
+                argb.val[2] = r_out;
+                argb.val[3] = alpha;
+                vst4q_u8(row + x * 4, argb);
             }
         }
 
@@ -441,12 +439,9 @@ static void u8_nchw_to_argb(const uint8_t *src, uint8_t *dst, uint32_t stride,
             int g = src_g[offset + x];
             int b = src_b[offset + x];
             if (boost_q4 != 0) {
-                int luma = (77 * r + 150 * g + 29 * b) >> 8;
-                r = r + (((r - luma) * boost_q4) >> 4);
-                g = g + (((g - luma) * boost_q4) >> 4);
-                b = b + (((b - luma) * boost_q4) >> 4);
+                r = r + ((r - g) * boost_q4 >> 4);
+                b = b + ((b - g) * boost_q4 >> 4);
                 if (r < 0) r = 0; else if (r > 255) r = 255;
-                if (g < 0) g = 0; else if (g > 255) g = 255;
                 if (b < 0) b = 0; else if (b > 255) b = 255;
             }
             row[px + 0] = (uint8_t)b;
@@ -517,11 +512,12 @@ bool gs_npu_upscale(NPUContext &ctx, const Framebuffer &input_fb, Framebuffer &o
                            output_fb.data, output_fb.stride,
                            ctx.output_w, ctx.output_h);
     } else {
-        // Compute saturation boost in Q4 fixed-point: boost_q4 = (factor - 1.0) * 16
+        // G-as-luma saturation boost: boost_q4 = (factor - 1) * 16
         int boost_q4 = 0;
         if (ctx.saturation_boost > 1.001f) {
-            boost_q4 = (int)((ctx.saturation_boost - 1.0f) * 16.0f + 0.5f);
-            if (boost_q4 > 112) boost_q4 = 112;  // cap at factor 8.0 to prevent int16 overflow
+            float boost = ctx.saturation_boost - 1.0f;
+            if (boost > 7.0f) boost = 7.0f;  // cap to prevent int16 overflow
+            boost_q4 = (int)(boost * 16.0f + 0.5f);
         }
         u8_nchw_to_argb(out_ptr, output_fb.data, output_fb.stride,
                         ctx.output_w, ctx.output_h, boost_q4);
