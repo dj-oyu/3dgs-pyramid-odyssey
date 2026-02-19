@@ -163,7 +163,9 @@ def create_espcn_model(mode="bilinear", weights_path=None):
     w2_shape = list(w2.shape)
     w3_shape = list(w3.shape)
 
-    # Define graph nodes
+    # Define graph nodes with uint8 output baked in.
+    # Note: INT8 quantization causes some color desaturation (~0.06 vs 0.21 native).
+    # This is a fundamental limitation of per-tensor INT8 quantization on [0,1] range.
     nodes = [
         helper.make_node("Conv", ["input", "w1", "b1"], ["conv1"],
                          name="conv1", kernel_shape=[5, 5], pads=[2, 2, 2, 2]),
@@ -215,41 +217,42 @@ def create_espcn_model(mode="bilinear", weights_path=None):
     return model
 
 
-def generate_calibration_data(num_samples=32):
-    """Generate synthetic image calibration data for pulsar2 quantization.
+def generate_calibration_data(num_samples=32, train_dir=None):
+    """Generate calibration data for pulsar2 quantization.
 
-    Uses structured patterns (gradients, blocks) instead of pure noise
-    for better quantization coverage of typical image content.
+    If train_dir is provided and contains rendered images, uses real frames
+    (downscaled to 540p as the model input). Otherwise falls back to synthetic.
+    Real calibration data is critical for accurate INT8 quantization ranges.
     """
+    if train_dir and os.path.isdir(train_dir):
+        from PIL import Image as PILImage
+        # Collect all jpg/ppm images from training directories
+        img_paths = []
+        for root, dirs, files in os.walk(train_dir):
+            for f in sorted(files):
+                if f.endswith(('.jpg', '.ppm', '.png')):
+                    img_paths.append(os.path.join(root, f))
+        if len(img_paths) >= num_samples:
+            rng = np.random.default_rng(42)
+            chosen = rng.choice(len(img_paths), num_samples, replace=False)
+            samples = []
+            for idx in chosen:
+                img = PILImage.open(img_paths[idx]).convert('RGB')
+                # Downscale to model input size (540p) using box filter
+                if img.size != (IN_W, IN_H):
+                    img = img.resize((IN_W, IN_H), PILImage.BILINEAR)
+                arr = np.array(img).astype(np.float32) / 255.0  # HWC [0,1]
+                nchw = arr.transpose(2, 0, 1)[None, :, :, :]   # NCHW
+                samples.append(nchw)
+            print(f"  Using {num_samples} real frames from {train_dir}")
+            return samples
+
+    # Fallback: synthetic patterns
+    print("  WARNING: No training data found, using synthetic calibration (may cause color loss)")
     rng = np.random.default_rng(123)
     samples = []
     for i in range(num_samples):
-        img = np.zeros((1, IN_C, IN_H, IN_W), dtype=np.float32)
-        kind = i % 4
-        if kind == 0:
-            # Horizontal gradient
-            grad = np.linspace(0, 1, IN_W, dtype=np.float32)
-            for c in range(IN_C):
-                offset = rng.uniform(0, 0.3)
-                img[0, c, :, :] = np.clip(grad[None, :] + offset, 0, 1)
-        elif kind == 1:
-            # Vertical gradient
-            grad = np.linspace(0, 1, IN_H, dtype=np.float32)
-            for c in range(IN_C):
-                offset = rng.uniform(0, 0.3)
-                img[0, c, :, :] = np.clip(grad[:, None] + offset, 0, 1)
-        elif kind == 2:
-            # Checkerboard blocks
-            block = rng.integers(8, 64)
-            yy = np.arange(IN_H) // block
-            xx = np.arange(IN_W) // block
-            checker = ((yy[:, None] + xx[None, :]) % 2).astype(np.float32)
-            for c in range(IN_C):
-                lo, hi = rng.uniform(0, 0.4), rng.uniform(0.6, 1.0)
-                img[0, c, :, :] = checker * (hi - lo) + lo
-        else:
-            # Smooth random patches (image-like)
-            img[0] = rng.uniform(0, 1, (IN_C, IN_H, IN_W)).astype(np.float32)
+        img = rng.uniform(0, 1, (1, IN_C, IN_H, IN_W)).astype(np.float32)
         samples.append(img)
     return samples
 
@@ -297,9 +300,10 @@ def main():
     assert out_dtype == TensorProto.UINT8, f"Output dtype is {out_dtype}, expected UINT8"
     print(f"  Output dtype verified: UINT8")
 
-    # Generate calibration data
+    # Generate calibration data (prefer real rendered frames)
     print("\nGenerating calibration data...")
-    samples = generate_calibration_data()
+    train_dir = os.path.join(project_dir, "data", "train")
+    samples = generate_calibration_data(train_dir=train_dir)
 
     tar_path = os.path.join(output_dir, "espcn_calibration.tar")
     with tarfile.open(tar_path, "w") as tar:

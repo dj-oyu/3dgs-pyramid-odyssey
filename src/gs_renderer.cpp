@@ -34,25 +34,35 @@ bool gs_renderer_init(Renderer &r, uint32_t width, uint32_t height, bool headles
     }
     r.current_fb = 0;
 
-    if (!headless && (width != r.display.width || height != r.display.height)) {
-        r.needs_upscale = true;
-        printf("[gs_renderer] Upscale: %ux%u -> %ux%u\n",
-               width, height, r.display.width, r.display.height);
+    // Determine upscale target resolution
+    uint32_t target_w = headless ? 0 : r.display.width;
+    uint32_t target_h = headless ? 0 : r.display.height;
 
-        // Try NPU super-resolution (only if explicitly requested)
-        if (use_npu && gs_npu_init(r.npu, "data/models/espcn_x2.axmodel")) {
-            // Allocate upscale framebuffer at display resolution (needs phys for VO)
-            bool up_phys = (r.display.backend == DisplayBackend::VO);
-            if (!gs_framebuffer_alloc(r.upscale_fb, r.display.width, r.display.height, up_phys)) {
-                fprintf(stderr, "[gs_renderer] Upscale framebuffer alloc failed, NPU disabled\n");
-                gs_npu_deinit(r.npu);
-            } else {
-                printf("[gs_renderer] NPU super-resolution enabled (%ux%u -> %ux%u)\n",
-                       width, height, r.display.width, r.display.height);
-            }
-        } else {
-            printf("[gs_renderer] NPU unavailable, using display-layer upscale\n");
+    if (!headless && (width != target_w || height != target_h)) {
+        r.needs_upscale = true;
+        printf("[gs_renderer] Upscale: %ux%u -> %ux%u\n", width, height, target_w, target_h);
+    }
+
+    // NPU super-resolution (works in both headless and display mode)
+    if (use_npu && gs_npu_init(r.npu, "data/models/espcn_x2.axmodel")) {
+        // In headless mode, infer target from NPU model output shape
+        if (headless) {
+            target_w = r.npu.output_w;
+            target_h = r.npu.output_h;
+            r.needs_upscale = true;
+            printf("[gs_renderer] Upscale: %ux%u -> %ux%u (headless)\n",
+                   width, height, target_w, target_h);
         }
+        bool up_phys = !headless && (r.display.backend == DisplayBackend::VO);
+        if (!gs_framebuffer_alloc(r.upscale_fb, target_w, target_h, up_phys)) {
+            fprintf(stderr, "[gs_renderer] Upscale framebuffer alloc failed, NPU disabled\n");
+            gs_npu_deinit(r.npu);
+        } else {
+            printf("[gs_renderer] NPU super-resolution enabled (%ux%u -> %ux%u)\n",
+                   width, height, target_w, target_h);
+        }
+    } else if (r.needs_upscale) {
+        printf("[gs_renderer] NPU unavailable, using display-layer upscale\n");
     }
 
     // Allocate raster context

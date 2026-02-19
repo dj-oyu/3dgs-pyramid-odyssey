@@ -52,6 +52,7 @@ static void print_usage(const char *prog) {
     printf("  --dump <dir>  Render from random viewpoints, save as JPEG, then exit\n");
     printf("  -n <count>    Number of dump frames (default: 8)\n");
     printf("  --sh-degree <N>  Cap SH evaluation degree (0-3, default: 3)\n");
+    printf("  --saturation <F>  NPU output saturation boost factor (default: 3.0 with --npu)\n");
     printf("  --bench <N>   Benchmark mode: render N frames with orbit camera, print timing, exit\n");
     printf("\nControls:\n");
     printf("  WASD       Move camera\n");
@@ -82,6 +83,7 @@ int main(int argc, char *argv[]) {
     int dump_count = 8;
     int max_sh_degree = MAX_SH_DEGREE;
     int bench_frames = 0;
+    float saturation = -1.0f;  // -1 = auto (3.0 with --npu, 1.0 without)
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-w") == 0 && i+1 < argc) {
@@ -108,6 +110,9 @@ int main(int argc, char *argv[]) {
             max_sh_degree = atoi(argv[++i]);
             if (max_sh_degree < 0) max_sh_degree = 0;
             if (max_sh_degree > 3) max_sh_degree = 3;
+        } else if (strcmp(argv[i], "--saturation") == 0 && i+1 < argc) {
+            saturation = atof(argv[++i]);
+            if (saturation < 1.0f) saturation = 1.0f;
         } else if (strcmp(argv[i], "--bench") == 0 && i+1 < argc) {
             bench_frames = atoi(argv[++i]);
             if (bench_frames < 1) bench_frames = 1;
@@ -128,7 +133,8 @@ int main(int argc, char *argv[]) {
 
     // Initialize system (skip for dump mode - no AX hardware needed)
     bool headless = (dump_dir != nullptr);
-    if (!headless) {
+    bool need_sys = !headless || use_npu;  // NPU needs AX_SYS even in headless mode
+    if (need_sys) {
         if (!gs_sys_init()) {
             fprintf(stderr, "Failed to initialize AX system\n");
             return 1;
@@ -141,7 +147,7 @@ int main(int argc, char *argv[]) {
     GaussianScene scene;
     if (!gs_ply_load(ply_path, scene)) {
         fprintf(stderr, "Failed to load PLY: %s\n", ply_path);
-        if (!headless) gs_sys_deinit();
+        if (need_sys) gs_sys_deinit();
         return 1;
     }
 
@@ -149,7 +155,7 @@ int main(int argc, char *argv[]) {
 
     if (info_only) {
         gs_scene_free(scene);
-        if (!headless) gs_sys_deinit();
+        if (need_sys) gs_sys_deinit();
         return 0;
     }
 
@@ -159,13 +165,21 @@ int main(int argc, char *argv[]) {
     if (!gs_renderer_init(renderer, render_w, render_h, headless, use_npu)) {
         fprintf(stderr, "Failed to initialize renderer\n");
         gs_scene_free(scene);
-        if (!headless) gs_sys_deinit();
+        if (need_sys) gs_sys_deinit();
         return 1;
     }
 
     renderer.max_sh_degree = max_sh_degree;
     if (max_sh_degree < MAX_SH_DEGREE) {
         printf("[main] SH degree capped: %d (scene has %d)\n", max_sh_degree, MAX_SH_DEGREE);
+    }
+
+    // Set NPU saturation boost (auto: 3.0 with NPU, 1.0 without)
+    if (renderer.npu.initialized) {
+        renderer.npu.saturation_boost = (saturation < 0) ? 4.5f : saturation;
+        if (renderer.npu.saturation_boost > 1.001f) {
+            printf("[main] NPU saturation boost: %.1fx\n", renderer.npu.saturation_boost);
+        }
     }
 
     if (render_scale > 1) {
@@ -307,7 +321,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            // Save PPM
+            // Save rendered frame
             Framebuffer &fb = renderer.framebuffers[1 - renderer.current_fb];  // last rendered
             char ppm_path[512], jpg_path[512];
             snprintf(ppm_path, sizeof(ppm_path), "%s/frame_%02d.ppm", dump_dir, vi);
@@ -315,16 +329,29 @@ int main(int argc, char *argv[]) {
 
             save_ppm(fb, ppm_path);
 
-            // Convert to JPEG via Python/Pillow
             char convert_cmd[1024];
             snprintf(convert_cmd, sizeof(convert_cmd),
                      "python3 -c \"from PIL import Image; Image.open('%s').save('%s', quality=90)\" 2>/dev/null",
                      ppm_path, jpg_path);
             system(convert_cmd);
 
-            // Remove PPM if JPEG was created
             snprintf(convert_cmd, sizeof(convert_cmd), "[ -f '%s' ] && rm '%s'", jpg_path, ppm_path);
             system(convert_cmd);
+
+            // Also save NPU upscaled frame if available
+            if (renderer.npu.initialized && renderer.upscale_fb.data) {
+                char npu_ppm[512], npu_jpg[512];
+                snprintf(npu_ppm, sizeof(npu_ppm), "%s/frame_%02d_npu.ppm", dump_dir, vi);
+                snprintf(npu_jpg, sizeof(npu_jpg), "%s/frame_%02d_npu.jpg", dump_dir, vi);
+                save_ppm(renderer.upscale_fb, npu_ppm);
+                snprintf(convert_cmd, sizeof(convert_cmd),
+                         "python3 -c \"from PIL import Image; Image.open('%s').save('%s', quality=95)\" 2>/dev/null",
+                         npu_ppm, npu_jpg);
+                system(convert_cmd);
+                snprintf(convert_cmd, sizeof(convert_cmd), "[ -f '%s' ] && rm '%s'", npu_jpg, npu_ppm);
+                system(convert_cmd);
+                printf("[dump] Frame %d/%d: NPU upscale -> %s\n", vi + 1, dump_count, npu_jpg);
+            }
 
             printf("[dump] Frame %d/%d: pos=(%.1f, %.1f, %.1f) yaw=%.0f pitch=%.0f | "
                    "Visible: %u/%u | %.1fms -> %s\n",
@@ -339,7 +366,7 @@ int main(int argc, char *argv[]) {
 
         gs_renderer_deinit(renderer);
         gs_scene_free(scene);
-        if (!headless) gs_sys_deinit();
+        if (need_sys) gs_sys_deinit();
         return 0;
     }
 

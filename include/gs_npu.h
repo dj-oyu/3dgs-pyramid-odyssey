@@ -35,6 +35,10 @@ struct NPUContext {
     int output_layout = 0;
     int input_dtype = 0;
     int output_dtype = 0;
+
+    // Post-processing: saturation boost to compensate INT8 quantization color loss.
+    // 1.0 = no change, 3.0 = recommended for INT8 NPU output.
+    float saturation_boost = 1.0f;
 };
 
 // Initialize NPU context: load .axmodel, AX_ENGINE_Init.
