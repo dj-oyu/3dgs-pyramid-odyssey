@@ -18,7 +18,9 @@ bool gs_raster_alloc(RasterContext &ctx, uint32_t width, uint32_t height);
 void gs_raster_free(RasterContext &ctx);
 
 // Assign projected Gaussians to tiles
-void gs_raster_assign_tiles(RasterContext &ctx, const ProjectedGaussian *gaussians, uint32_t count);
+// sorted_indices: indices into gaussians[] in depth order (from gs_sort_by_depth)
+void gs_raster_assign_tiles(RasterContext &ctx, const ProjectedGaussian *gaussians,
+                            const uint32_t *sorted_indices, uint32_t count);
 
 // Rasterize tiles into framebuffer (multi-threaded, NEON alpha compositing)
 // mau_ctx: optional MAU acceleration context (nullptr to skip)

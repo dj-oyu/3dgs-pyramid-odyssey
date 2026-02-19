@@ -297,32 +297,18 @@ int main(int argc, char *argv[]) {
                 const ProjectedGaussian *pgs = renderer.projection.gaussians;
                 uint32_t pc = renderer.projection.count;
                 float max_radius = 0, avg_radius = 0;
-                uint32_t spike_count = 0;  // eigenvalue ratio > 100
-                float max_eigen_ratio = 0;
                 for (uint32_t pi = 0; pi < pc; pi++) {
-                    float a = pgs[pi].cov2d_a, b = pgs[pi].cov2d_b, c = pgs[pi].cov2d_c;
-                    float det = a * c - b * b;
-                    float mid = 0.5f * (a + c);
-                    float disc = mid * mid - det;
-                    float lmax = mid + sqrtf(fmaxf(0.0f, disc));
-                    float lmin = mid - sqrtf(fmaxf(0.0f, disc));
-                    if (lmin < 0.001f) lmin = 0.001f;
-                    float ratio = lmax / lmin;
-                    if (ratio > max_eigen_ratio) max_eigen_ratio = ratio;
-                    if (ratio > 100.0f) spike_count++;
                     avg_radius += pgs[pi].radius;
                     if (pgs[pi].radius > max_radius) max_radius = pgs[pi].radius;
                 }
                 avg_radius /= (pc > 0 ? pc : 1);
                 printf("[diag] Projected: %u gaussians\n", pc);
                 printf("[diag] Radius: avg=%.1f max=%.1f\n", avg_radius, max_radius);
-                printf("[diag] Eigenvalue ratio: max=%.1f, spikes(>100x)=%u (%.1f%%)\n",
-                       max_eigen_ratio, spike_count, 100.0f * spike_count / (pc > 0 ? pc : 1));
-                // Sample a few projected Gaussians
+                // Sample a few projected Gaussians (cov2d fields are now inv_cov ha/hb/hc)
                 for (uint32_t si = 0; si < 5 && si < pc; si++) {
                     uint32_t pi = si * (pc / 5);
                     printf("[diag] PG[%u]: screen=(%.1f,%.1f) depth=%.2f radius=%.1f "
-                           "cov=(%.2f,%.2f,%.2f) color=(%.2f,%.2f,%.2f) opacity=%.2f\n",
+                           "icov=(%.4f,%.4f,%.4f) premul=(%.2f,%.2f,%.2f) opacity=%.2f\n",
                            pi, pgs[pi].screen_x, pgs[pi].screen_y, pgs[pi].depth,
                            pgs[pi].radius, pgs[pi].cov2d_a, pgs[pi].cov2d_b, pgs[pi].cov2d_c,
                            pgs[pi].color_r, pgs[pi].color_g, pgs[pi].color_b, pgs[pi].opacity);
@@ -397,11 +383,11 @@ int main(int argc, char *argv[]) {
         printf("\n=== Benchmark: %d frames, %ux%u, SH degree %d%s ===\n",
                bench_frames, render_w, render_h, max_sh_degree,
                max_gaussians > 0 ? ", capped" : "");
-        printf("%5s %8s %8s %8s %8s %8s %8s  | %7s %7s %7s %7s\n",
-               "Frame", "Proj", "Sort", "Raster", "Upscale", "Total", "FPS",
+        printf("%5s %8s %8s %8s %8s %8s %8s %8s  | %7s %7s %7s %7s\n",
+               "Frame", "Proj", "Sort", "Assign", "Raster", "Upscale", "Total", "FPS",
                "Cull", "Cov", "Color", "Asm");
 
-        float sum_proj = 0, sum_sort = 0, sum_raster = 0, sum_upscale = 0, sum_total = 0;
+        float sum_proj = 0, sum_sort = 0, sum_assign = 0, sum_raster = 0, sum_upscale = 0, sum_total = 0;
         float sum_cull = 0, sum_cov = 0, sum_color = 0, sum_asm = 0;
 
         for (int fi = 0; fi < bench_frames; fi++) {
@@ -424,13 +410,14 @@ int main(int argc, char *argv[]) {
             gs_renderer_render_frame(renderer, scene, cam_params);
 
             const RenderStats &s = gs_renderer_get_stats(renderer);
-            printf("%5d %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f  | %6.1f %6.1f %6.1f %6.1f\n",
-                   fi, s.time_project_ms, s.time_sort_ms, s.time_raster_ms,
+            printf("%5d %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f  | %6.1f %6.1f %6.1f %6.1f\n",
+                   fi, s.time_project_ms, s.time_sort_ms, s.time_assign_ms, s.time_raster_ms,
                    s.time_upscale_ms, s.time_total_ms, s.fps,
                    s.time_cull_ms, s.time_cov_ms, s.time_color_ms, s.time_assemble_ms);
 
             sum_proj += s.time_project_ms;
             sum_sort += s.time_sort_ms;
+            sum_assign += s.time_assign_ms;
             sum_raster += s.time_raster_ms;
             sum_upscale += s.time_upscale_ms;
             sum_total += s.time_total_ms;
@@ -441,9 +428,9 @@ int main(int argc, char *argv[]) {
         }
 
         float n = (float)bench_frames;
-        printf("──────────────────────────────────────────────────────────────────────────────\n");
-        printf("  AVG %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f  | %6.1f %6.1f %6.1f %6.1f\n",
-               sum_proj/n, sum_sort/n, sum_raster/n, sum_upscale/n, sum_total/n,
+        printf("────────────────────────────────────────────────────────────────────────────────────────\n");
+        printf("  AVG %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f  | %6.1f %6.1f %6.1f %6.1f\n",
+               sum_proj/n, sum_sort/n, sum_assign/n, sum_raster/n, sum_upscale/n, sum_total/n,
                1000.0f / (sum_total/n),
                sum_cull/n, sum_cov/n, sum_color/n, sum_asm/n);
         printf("\nVisible (last frame): %u/%u | Tiles: %u\n",

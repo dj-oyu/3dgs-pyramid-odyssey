@@ -195,12 +195,10 @@ void gs_mau_build_g_matrix(float *G_T, const ProjectedGaussian *gaussians,
     for (uint32_t k = 0; k < K; k++) {
         const ProjectedGaussian &pg = gaussians[indices[k]];
 
-        // Compute inverse covariance
-        float det = pg.cov2d_a * pg.cov2d_c - pg.cov2d_b * pg.cov2d_b;
-        float inv_det = (det > 0.0f) ? 1.0f / det : 0.0f;
-        float inv_a =  pg.cov2d_c * inv_det;
-        float inv_b = -pg.cov2d_b * inv_det;
-        float inv_c =  pg.cov2d_a * inv_det;
+        // cov2d_a/b/c are precomputed: ha=0.5*inv_a, hb=inv_b, hc=0.5*inv_c
+        float inv_a = 2.0f * pg.cov2d_a;   // ha * 2
+        float inv_b = pg.cov2d_b;           // hb = inv_b
+        float inv_c = 2.0f * pg.cov2d_c;   // hc * 2
 
         // Gaussian center offset from tile origin
         float Sx = pg.screen_x - tile_ox;
@@ -209,8 +207,8 @@ void gs_mau_build_g_matrix(float *G_T, const ProjectedGaussian *gaussians,
         float *row = &G_T[k * 6];
         row[0] = -(inv_a * Sx + inv_b * Sy);                        // coeff for (lx+0.5)
         row[1] = -(inv_b * Sx + inv_c * Sy);                        // coeff for (ly+0.5)
-        row[2] = 0.5f * inv_a;                                       // coeff for (lx+0.5)^2
-        row[3] = 0.5f * inv_c;                                       // coeff for (ly+0.5)^2
+        row[2] = 0.5f * inv_a;                                       // coeff for (lx+0.5)^2 = ha
+        row[3] = 0.5f * inv_c;                                       // coeff for (ly+0.5)^2 = hc
         row[4] = inv_b;                                               // coeff for (lx+0.5)(ly+0.5)
         row[5] = 0.5f * (inv_a * Sx * Sx + 2.0f * inv_b * Sx * Sy + inv_c * Sy * Sy);  // constant
     }

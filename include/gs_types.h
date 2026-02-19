@@ -69,8 +69,8 @@ struct GaussianScene {
 struct ProjectedGaussian {
     float screen_x, screen_y;     // 2D screen position
     float depth;                  // Depth for sorting
-    float cov2d_a, cov2d_b, cov2d_c;  // 2D covariance (symmetric: [[a,b],[b,c]])
-    float color_r, color_g, color_b;   // Evaluated color
+    float cov2d_a, cov2d_b, cov2d_c;  // Inverse 2D covariance quadratic: ha=0.5*C/det, hb=-B/det, hc=0.5*A/det
+    float color_r, color_g, color_b;   // Pre-multiplied color (color * opacity)
     float opacity;                // Opacity
     float radius;                 // Bounding radius in pixels
     uint32_t orig_idx;            // Index into original scene arrays
@@ -121,6 +121,7 @@ struct RenderStats {
     float time_color_ms;
     float time_assemble_ms;
     // NPU super-resolution upscale
+    float time_assign_ms;     // Tile assignment latency
     float time_upscale_ms;    // NPU upscale latency (0 if not used)
     // Accelerator rasterizer stats
     uint32_t mau_tiles;       // Tiles processed via MAU path

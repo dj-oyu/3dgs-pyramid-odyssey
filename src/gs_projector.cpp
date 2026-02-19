@@ -484,13 +484,15 @@ static void *cov_thread_func(void *arg) {
             if (sy + rad < 0 || sy - rad >= a.screen_h) continue;
             if (rad < 0.3f) continue;
 
+            // Precompute inverse covariance for rasterizer (det>0 guaranteed here)
+            float inv_det = fast_recipf(det);
             batch.visible_indices[out] = idx4[k];
             batch.screen_x[out] = sx;
             batch.screen_y[out] = sy;
             batch.depth[out] = z_a[k];
-            batch.cov2d_a[out] = ca;
-            batch.cov2d_b[out] = cb;
-            batch.cov2d_c[out] = cc;
+            batch.cov2d_a[out] = 0.5f * cc * inv_det;  // ha
+            batch.cov2d_b[out] = -cb * inv_det;         // hb
+            batch.cov2d_c[out] = 0.5f * ca * inv_det;   // hc
             batch.radius[out] = rad;
             out++;
         }
@@ -534,10 +536,14 @@ static void *cov_thread_func(void *arg) {
         if (sy + rad < 0 || sy - rad >= a.screen_h) continue;
         if (rad < 0.3f) continue;
 
+        // Precompute inverse covariance for rasterizer (det>0 guaranteed here)
+        float inv_det_s = fast_recipf(det);
         batch.visible_indices[out] = idx;
         batch.screen_x[out] = sx; batch.screen_y[out] = sy;
         batch.depth[out] = z;
-        batch.cov2d_a[out] = ca; batch.cov2d_b[out] = cb; batch.cov2d_c[out] = cc;
+        batch.cov2d_a[out] = 0.5f * cc * inv_det_s;  // ha
+        batch.cov2d_b[out] = -cb * inv_det_s;         // hb
+        batch.cov2d_c[out] = 0.5f * ca * inv_det_s;   // hc
         batch.radius[out] = rad;
         out++;
     }
@@ -804,18 +810,22 @@ void gs_project_assemble(const GaussianScene &scene, const ProjectionBatch &batc
     uint32_t count = batch.cov_count;
     if (count > result.capacity) count = result.capacity;
 
+    // inv_cov (ha/hb/hc) already precomputed in Cov phase
+    // Pre-multiply color×opacity so rasterizer avoids per-tile redundant work
     for (uint32_t j = 0; j < count; j++) {
+        float opacity = scene.opacity[batch.visible_indices[j]];
+
         ProjectedGaussian &pg = result.gaussians[j];
         pg.screen_x = batch.screen_x[j];
         pg.screen_y = batch.screen_y[j];
         pg.depth    = batch.depth[j];
-        pg.cov2d_a  = batch.cov2d_a[j];
-        pg.cov2d_b  = batch.cov2d_b[j];
-        pg.cov2d_c  = batch.cov2d_c[j];
-        pg.color_r  = batch.color_r[j];
-        pg.color_g  = batch.color_g[j];
-        pg.color_b  = batch.color_b[j];
-        pg.opacity  = scene.opacity[batch.visible_indices[j]];
+        pg.cov2d_a  = batch.cov2d_a[j];  // ha (precomputed)
+        pg.cov2d_b  = batch.cov2d_b[j];  // hb (precomputed)
+        pg.cov2d_c  = batch.cov2d_c[j];  // hc (precomputed)
+        pg.color_r  = batch.color_r[j] * opacity;  // pre-multiplied
+        pg.color_g  = batch.color_g[j] * opacity;
+        pg.color_b  = batch.color_b[j] * opacity;
+        pg.opacity  = opacity;
         pg.radius   = batch.radius[j];
         pg.orig_idx = batch.visible_indices[j];
     }

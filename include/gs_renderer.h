@@ -3,6 +3,7 @@
 #include "gs_types.h"
 #include "gs_projector.h"
 #include "gs_rasterizer.h"
+#include "gs_sort.h"
 #include "gs_npu.h"
 #include "gs_mau.h"
 #include "gs_display.h"
@@ -11,6 +12,7 @@
 struct Renderer {
     ProjectionResult projection;
     ProjectionBatch proj_batch;
+    SortContext sort_ctx;
     RasterContext raster;
     NPUContext npu;
     MAUContext mau;

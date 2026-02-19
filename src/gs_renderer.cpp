@@ -92,6 +92,7 @@ void gs_renderer_deinit(Renderer &r) {
     if (r.upscale_fb.data) gs_framebuffer_free(r.upscale_fb);
     gs_projection_free(r.projection);
     gs_projection_batch_free(r.proj_batch);
+    gs_sort_free(r.sort_ctx);
     gs_raster_free(r.raster);
     gs_framebuffer_free(r.framebuffers[0]);
     gs_framebuffer_free(r.framebuffers[1]);
@@ -144,18 +145,25 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
 
     double t_proj_end = get_time_ms();
 
-    // 2. Sort by depth (front-to-back)
+    // 2. Sort by depth (index-only, no physical reorder)
     double t_sort_start = get_time_ms();
-    gs_radix_sort_by_depth(r.projection.gaussians, r.projection.count);
+    if (!r.sort_ctx.pairs) {
+        gs_sort_alloc(r.sort_ctx, scene.num_gaussians);
+    }
+    uint32_t vis_count = r.projection.count;
+    gs_sort_by_depth(r.sort_ctx, r.projection.gaussians, vis_count);
     double t_sort_end = get_time_ms();
 
     // 2b. Cap visible Gaussians (for scaling experiments)
-    if (r.max_gaussians > 0 && r.projection.count > r.max_gaussians) {
-        r.projection.count = r.max_gaussians;
+    if (r.max_gaussians > 0 && vis_count > r.max_gaussians) {
+        vis_count = r.max_gaussians;
     }
 
-    // 3. Assign to tiles
-    gs_raster_assign_tiles(r.raster, r.projection.gaussians, r.projection.count);
+    // 3. Assign to tiles (using sorted indices)
+    double t_assign_start = get_time_ms();
+    gs_raster_assign_tiles(r.raster, r.projection.gaussians,
+                           r.sort_ctx.sorted_indices, vis_count);
+    double t_assign_end = get_time_ms();
 
     // 4. Rasterize into current framebuffer
     double t_raster_start = get_time_ms();
@@ -186,7 +194,7 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
     double t_end = get_time_ms();
 
     // Update stats
-    r.stats.num_visible = r.projection.count;
+    r.stats.num_visible = vis_count;
     r.stats.time_project_ms = (float)(t_proj_end - t_proj_start);
     r.stats.time_sort_ms = (float)(t_sort_end - t_sort_start);
     r.stats.time_raster_ms = (float)(t_raster_end - t_raster_start);
@@ -196,6 +204,7 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
     r.stats.time_cov_ms = (float)(t_cov_end - t_cov_start);
     r.stats.time_color_ms = (float)(t_color_end - t_color_start);
     r.stats.time_assemble_ms = (float)(t_asm_end - t_asm_start);
+    r.stats.time_assign_ms = (float)(t_assign_end - t_assign_start);
     r.stats.time_upscale_ms = (r.needs_upscale && r.npu.initialized)
                               ? (float)(t_upscale_end - t_upscale_start) : 0.0f;
     r.stats.mau_tiles = mau_tiles;
