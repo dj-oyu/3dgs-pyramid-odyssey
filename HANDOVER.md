@@ -1,99 +1,114 @@
-# Handover — 2026-02-19
+# Handover — 2026-02-20 (Session 3)
 
 ## Current Status
 
-All 4 plan tasks completed (except pulsar2 compile which requires x86 host):
+Renderer optimized from 77.6ms/12.9 FPS to **49.2ms/20.3 FPS (+57%)** on Mars 62K Gaussians @ 540p.
+All three major subsystems (projection, sort, rasterizer) have been optimized.
+FP16 tile accumulation verified with no visible quality degradation.
 
-- **ESPCN trained**: 42.80 dB PSNR on validation (target was >28 dB). Weights saved.
-- **ONNX exported**: Trained weights with DCR→CRD remapping + uint8 output baked in graph
-- **Rasterizer optimized**: Atomic work-stealing, tighter thresholds, `--sh-degree`, `--bench` flags
-- **BLOCKED**: pulsar2 recompile on x86 host needed to deploy trained .axmodel
+## What Was Done (This Session)
 
-## What Was Done
+### Sort Optimization: 16-Bit Quantized Radix Sort
+- Replaced 64-bit radix sort (4 passes on `uint64_t` key|index pairs) with 16-bit quantized sort
+- For ≤65535 visible Gaussians: packs `(depth16 << 16 | index16)` into `uint32_t`, 2 radix passes
+- Index-only output — `sorted_indices[]` array, no physical permute of ProjectedGaussian array
+- Three paths: insertion sort (≤128), 16-bit compact (≤65535), 64-bit fallback
+- **Sort: 4.3ms → 2.5ms**
 
-### Task 1: Train ESPCN Weights
-- Installed PyTorch (torch-2.10.0+cpu, aarch64)
-- Generated 192 training frames: `build/gs_splat --dump` for Mars, InteriorDesign, Auditorium (64 each)
-- Created `tools/train_espcn.py`:
-  - Manual batch loop (no DataLoader) for ARM performance
-  - Pre-loads images as uint8 (~1.2GB), 2x2 box downscale via numpy reshape+mean
-  - L1 loss, Adam, CosineAnnealingLR, 100 epochs × 100 batches × 16 samples
-  - Random 48×48 LR / 96×96 HR crops with flip/rotation augmentation
-- Training results: **42.80 dB** best validation PSNR (epoch 90)
-- PSNR progression: 26.96 → 35.76 → 38.37 → 39.67 → 40.10 → 41.02 → 41.44 → 41.90 → 42.80 dB
+### Prefetch-Accelerated Physical Permute (Attempted, Reverted)
+- Implemented `gs_sort_permute()` with `__builtin_prefetch` distance 8 to restore sequential access in assign
+- Result: permute cost (4.2ms) cancelled assign improvement (4.0ms) — net zero
+- Root cause: 2.8MB ProjectedGaussian array exceeds L2 (256KB), random gather costs ~4ms regardless of where it's paid
+- **Decision: Reverted to index-only sort (simpler, equivalent performance)**
 
-### Task 2: Fix uint8 Output
-- Modified `tools/gen_espcn_onnx.py`: added Mul(255)→Clip(0,255)→Cast(uint8) after DepthToSpace
-- ONNX output tensor is now UINT8 (verified: dtype=2)
-- Added `--weights` flag for trained weight injection with DCR→CRD channel remapping
-- Expected savings after pulsar2 recompile: buffer 24.8MB→6.2MB, out_cvt 14ms→~3ms
+### Persistent Rasterizer Thread Pool
+- Replaced per-frame `pthread_create`/`pthread_join` with persistent `RasterThreadPool`
+- Workers persist across frames using `pthread_barrier_t` start/end barriers
+- Eliminates ~0.3ms thread management overhead per frame
 
-### Task 3: Rasterizer Optimizations
-- **3a. Atomic work-stealing** (`src/gs_rasterizer.cpp`): Replaced static `tile_start/tile_end` block partition with shared `volatile uint32_t next_tile` + `__sync_fetch_and_add`. All 8 threads grab tiles dynamically.
-- **3b. Tighter thresholds** (`include/gs_types.h`): `ALPHA_THRESHOLD` 1/255→2/255, `TRANSMITTANCE_MIN` 0.003→0.01
-- **3c. `--sh-degree N`** (`src/gs_projector.cpp`, `include/gs_projector.h`, `include/gs_renderer.h`, `src/gs_renderer.cpp`, `src/main.cpp`): Cap SH evaluation at degree 0-3
-- **3d. `--bench N`** (`src/main.cpp`): Orbit camera around scene center, print per-frame timing breakdown (proj/sort/raster/upscale/total/FPS), averages at end
+### FP16 Tile Accumulation (Main Raster Optimization)
+- Tile buffers changed from `float[16][16]` to `__fp16[16][16]` (tile_r, tile_g, tile_b, tile_T)
+- Tier 1 inner loop runs entirely in FP16 NEON (8-wide `float16x8_t`):
+  - Mahalanobis distance, Gaussian evaluation, alpha blending all in FP16
+  - Eliminates FP16→FP32 widening and FP32→FP16 narrowing per pixel
+  - ~57 → ~39 NEON instructions per 8 pixels
+- Tier 2 (4-wide FP32 remainder) loads/stores FP16 from tiles
+- FP16 precision (10-bit mantissa, 1024 levels) sufficient for 8-bit output (256 levels)
+- Quality verified via JPEG dump — no visible degradation
+- **Raster: 26.2ms → 24.2ms (-7.6%)**
 
-### Other
-- Updated `CLAUDE.md` with new flags, training results, current status
-- Verified C++ builds clean after all changes
-- Verified rendering works (dump mode)
+### Other Fixes
+- MAU hardware probe: graceful detection + disable on AX650C (prevents error spam)
+- Thresholds tightened: ALPHA_THRESHOLD 1/255→2/255, TRANSMITTANCE_MIN 0.003→0.01
+
+### Cumulative Benchmark (32 frames, 960×540, Mars.ply)
+
+| Phase    | Session 1 | Session 2 | Session 3 | Speedup |
+|----------|-----------|-----------|-----------|---------|
+| Proj     | 30.2ms    | 11.8ms    | 9.8ms     | 3.1x    |
+| Sort     | 10.6ms    | 11.0ms    | 2.5ms     | 4.2x    |
+| Assign   | —         | —         | 10.1ms    | —       |
+| Raster   | 28.0ms    | 30.9ms    | 24.2ms    | 1.2x    |
+| **Total**| **77.6ms**| **62.4ms**| **49.2ms**| **1.58x** |
+| **FPS**  | **12.9**  | **16.0**  | **20.3**  | **1.57x** |
 
 ## Key Decisions
 
-1. **2x2 box downscale** (not bicubic): Matches the actual camera rendering pipeline (pixel averaging). ~50x faster than Pillow bicubic on ARM.
-2. **DCR→CRD weight remapping**: PyTorch PixelShuffle=DCR, compiled model uses CRD DepthToSpace. Remap `CRD[c*4+d] = DCR[d*3+c]` at ONNX export time.
-3. **uint8 baked into ONNX graph**: Rather than relying on pulsar2 `output_processors` (which silently ignores `output_dtype: "U8"`), added Mul/Clip/Cast nodes directly into the model graph.
-4. **Atomic work-stealing over task queue**: Simple `__sync_fetch_and_add` on shared counter. ~2040 tiles at 540p means negligible contention, no complex queue needed.
-5. **Trained on rendered frames**: Used actual 3DGS rendered output (not DIV2K/external datasets) for domain-specific SR quality.
+1. **Index-only sort over physical permute**: Experimentally proved that for arrays exceeding L2, random access penalty (~4ms) is invariant to placement. Simpler code wins.
+2. **FP16 accumulation over 2-Gaussian batching**: FP16 reduces instruction count by ~30% with no quality loss. Batching would save ~10% but adds complexity.
+3. **Persistent thread pool for rasterizer only**: Projection already uses per-frame threads (acceptable overhead). Rasterizer benefits more due to per-frame tile dispatch.
+4. **Tighter thresholds**: ALPHA 2/255 and TRANSMITTANCE_MIN 0.01 save 5-10% raster time, visually imperceptible.
 
 ## Open Issues
 
-1. **pulsar2 recompile required on x86**: New ONNX with trained weights + uint8 output needs compilation to .axmodel. Cannot run on this ARM device.
-   ```bash
-   # On x86 host:
-   pulsar2 build --input data/models/espcn_x2.onnx --output_dir output \
-     --config data/models/espcn_config.json --target_hardware AX650
-   scp output/compiled.axmodel device:data/models/espcn_x2.axmodel
-   ```
-2. **Benchmarks not yet run**: `--bench` mode requires sudo for display. Run after pulsar2 recompile to get full before/after numbers.
-3. **Rasterizer optimizations untested**: Atomic work-stealing and threshold changes built but not benchmarked yet (needs `--bench`).
+1. **Assign is now the largest sub-phase at 10.1ms (20% of frame)**: Random indirect access into 2.8MB ProjectedGaussian array. Structural limitation of L2 size.
+2. **Raster still 24.2ms (49% of frame)**: Per-pixel work is already lean. Further gains likely require algorithmic changes (fewer Gaussians per tile, hierarchical culling).
+3. **pulsar2 recompile still required on x86**: ONNX with trained weights + uint8 output ready, needs compilation to .axmodel.
+4. **ODR hazard with Makefile**: No header dependency tracking. Struct field additions require `make clean && make` or stale object files cause silent memory corruption.
 
 ## Next Steps (Priority Order)
 
-1. **[X86] Compile new .axmodel** with pulsar2 from `data/models/espcn_x2.onnx`
-2. **Deploy and test** NPU with trained weights: `sudo build/gs_splat ~/ply/Mars.ply -s 2 --npu`
-3. **Run benchmarks** (Task 4): `sudo build/gs_splat ~/ply/Mars.ply -s 2 --bench 32` for all scene/mode combos
-4. **Commit all changes** — large set of uncommitted work
+1. **Rasterizer algorithmic optimization** — 24.2ms is 49% of frame. Candidates:
+   - Hierarchical tile culling (skip tiles where no Gaussian overlaps)
+   - Tighter per-tile Gaussian overlap test (reduce avg Gaussians/tile)
+   - Row-level saturation bitmask (skip fully-opaque rows)
+2. **Assign optimization** — 10.1ms for indirect scatter. Possible approaches:
+   - AoSoA layout for ProjectedGaussian (cache-line-friendly groups of 4-8)
+   - Reduce ProjectedGaussian struct size (currently 48 bytes, could compress icov/color)
+3. **[X86] Compile new .axmodel** with pulsar2 from `data/models/espcn_x2.onnx`
+4. **Full benchmark suite** — All 3 scenes × all modes after optimizations stabilize
+5. **Makefile header dependency tracking** — Add `-MMD -MP` flags, include `.d` files
 
 ## Important Files
 
-### Created this session
-- `tools/train_espcn.py` — ESPCN training script (PyTorch CPU, manual batch loop)
-- `data/models/espcn_weights.npz` — Trained weights (108KB, DCR ordering)
-
 ### Modified this session
-- `tools/gen_espcn_onnx.py` — `--weights` flag, DCR→CRD remap, uint8 output nodes
-- `src/gs_rasterizer.cpp` — Atomic work-stealing (replaced static block partition)
-- `include/gs_types.h` — Tightened `ALPHA_THRESHOLD` (2/255), `TRANSMITTANCE_MIN` (0.01)
-- `src/gs_projector.cpp` — SH degree capping via `max_sh_degree` parameter
-- `include/gs_projector.h` — `max_sh_degree` parameter in `gs_project_color()`
-- `include/gs_renderer.h` — `max_sh_degree` field in Renderer
-- `src/gs_renderer.cpp` — Passes `max_sh_degree` to projector
-- `src/main.cpp` — `--sh-degree N`, `--bench N` flags
-- `CLAUDE.md` — Updated status, added Renderer Flags section
-- `data/models/espcn_x2.onnx` — Regenerated with trained weights + uint8 output
+- `src/gs_sort.cpp` — 16-bit quantized radix sort, index-only output (154 insertions)
+- `include/gs_sort.h` — SortContext with sorted_indices (no pg_temp)
+- `src/gs_rasterizer.cpp` — Persistent thread pool, FP16 tile accumulation, sorted_indices assign (483 changed lines)
+- `include/gs_rasterizer.h` — Updated assign signature with sorted_indices parameter
+- `src/gs_renderer.cpp` — Updated pipeline: sort→assign with sorted_indices, SortContext member
+- `include/gs_renderer.h` — Added SortContext sort_ctx, max_sh_degree fields
+- `include/gs_types.h` — Threshold constants (ALPHA_THRESHOLD, TRANSMITTANCE_MIN)
+- `src/gs_projector.cpp` — Hoisted constants, early culls
+- `src/main.cpp` — --bench, --sh-degree flags
+- `src/gs_mau.cpp` — MAU hardware probe fix
+
+### Benchmark logs
+- `bench.log` — Session 3 final benchmark (49.2ms/20.3 FPS)
+- `dump_img.log` — FP16 quality verification dump
+- `opt_phase*.log` — Earlier optimization phase logs
 
 ### Key reference files
-- `data/models/espcn_config.json` — pulsar2 config
-- `data/models/espcn_calibration.tar` — Calibration data (32 samples) for pulsar2
-- `include/gs_npu.h` / `src/gs_npu.cpp` — NPU wrapper (auto-detects uint8 output)
+- `tools/gen_espcn_onnx.py` — ESPCN ONNX generator (trained weights + uint8 output)
+- `tools/train_espcn.py` — ESPCN training script
+- `docs/HARDWARE_REPORT.md` — Full hardware capability analysis
 
 ## Context & Notes
 
-- **Training data**: 192 frames at `data/train/{mars,interior,auditorium}/` (64 per scene, 1080p PPM)
-- **Auditorium PLY**: Actual filename is `"Auditorium by the sea.ply"` (with spaces). Symlink created: `~/ply/Auditorium.ply`
-- **Training perf on ARM**: ~109s/epoch (100 batches × 16 samples). Total ~3 hours for 100 epochs. Key: pre-load as uint8, numpy box downscale (not Pillow bicubic), manual batch loop (not DataLoader).
-- **gs_npu.cpp already handles uint8 output**: `u8_nchw_to_argb()` path exists and is auto-dispatched based on model output dtype. No C++ changes needed for uint8.
-- **Mars.ply**: 62,002 gaussians, SH degree 3. ~57K visible at default camera.
-- **sudo required**: HDMI rendering and NPU need sudo. Dump mode (`--dump`) and `--bench` work without sudo only in dump mode.
+- **Commit**: 0cede54 — "Optimize sort + rasterizer: 16-bit radix sort, FP16 tiles, persistent threads"
+- **Previous commits**: 6920830 (projection optimization), 5bfccfb (ESPCN training + rasterizer basics)
+- **Mars.ply**: 62,002 Gaussians, ~57K visible at default camera. SH degree 3.
+- **Cortex-A55 limits**: L1D 32KB, L2 256KB (shared). FP16 tile buffers (2KB) fit L1. ProjectedGaussian array (2.8MB) far exceeds L2.
+- **FP16 NEON**: `float16x8_t` processes 8 pixels/cycle. No `vbslq_f16` intrinsic — use `vreinterpretq` workaround via `u16`.
+- **sudo required**: HDMI rendering and NPU need sudo. `--bench` needs sudo for display init. `--dump` works without sudo.
+- **Three-tier rasterizer**: Tier 1 (FP16 8-wide, main path), Tier 2 (FP32 4-wide, remainder ≥4px), Tier 3 (scalar tail <4px).
