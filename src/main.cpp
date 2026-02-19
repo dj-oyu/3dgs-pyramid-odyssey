@@ -51,6 +51,8 @@ static void print_usage(const char *prog) {
     printf("  --vsync       Enable vsync\n");
     printf("  --dump <dir>  Render from random viewpoints, save as JPEG, then exit\n");
     printf("  -n <count>    Number of dump frames (default: 8)\n");
+    printf("  --sh-degree <N>  Cap SH evaluation degree (0-3, default: 3)\n");
+    printf("  --bench <N>   Benchmark mode: render N frames with orbit camera, print timing, exit\n");
     printf("\nControls:\n");
     printf("  WASD       Move camera\n");
     printf("  Q/E        Up/Down\n");
@@ -78,6 +80,8 @@ int main(int argc, char *argv[]) {
     bool vsync = false;
     bool use_npu = false;
     int dump_count = 8;
+    int max_sh_degree = MAX_SH_DEGREE;
+    int bench_frames = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-w") == 0 && i+1 < argc) {
@@ -100,6 +104,13 @@ int main(int argc, char *argv[]) {
             use_npu = true;
         } else if (strcmp(argv[i], "--dump") == 0 && i+1 < argc) {
             dump_dir = argv[++i];
+        } else if (strcmp(argv[i], "--sh-degree") == 0 && i+1 < argc) {
+            max_sh_degree = atoi(argv[++i]);
+            if (max_sh_degree < 0) max_sh_degree = 0;
+            if (max_sh_degree > 3) max_sh_degree = 3;
+        } else if (strcmp(argv[i], "--bench") == 0 && i+1 < argc) {
+            bench_frames = atoi(argv[++i]);
+            if (bench_frames < 1) bench_frames = 1;
         } else if (argv[i][0] != '-') {
             ply_path = argv[i];
         }
@@ -150,6 +161,11 @@ int main(int argc, char *argv[]) {
         gs_scene_free(scene);
         if (!headless) gs_sys_deinit();
         return 1;
+    }
+
+    renderer.max_sh_degree = max_sh_degree;
+    if (max_sh_degree < MAX_SH_DEGREE) {
+        printf("[main] SH degree capped: %d (scene has %d)\n", max_sh_degree, MAX_SH_DEGREE);
     }
 
     if (render_scale > 1) {
@@ -324,6 +340,75 @@ int main(int argc, char *argv[]) {
         gs_renderer_deinit(renderer);
         gs_scene_free(scene);
         if (!headless) gs_sys_deinit();
+        return 0;
+    }
+
+    // === Benchmark mode: render N frames with orbit camera, print timing ===
+    if (bench_frames > 0) {
+        // Compute scene center and radius (same as dump mode)
+        float cx = 0, cy = 0, cz = 0;
+        for (uint32_t gi = 0; gi < scene.num_gaussians; gi++) {
+            cx += scene.pos_x[gi]; cy += scene.pos_y[gi]; cz += scene.pos_z[gi];
+        }
+        cx /= scene.num_gaussians; cy /= scene.num_gaussians; cz /= scene.num_gaussians;
+        float rms_dist = 0;
+        for (uint32_t gi = 0; gi < scene.num_gaussians; gi++) {
+            float ddx = scene.pos_x[gi] - cx, ddy = scene.pos_y[gi] - cy, ddz = scene.pos_z[gi] - cz;
+            rms_dist += ddx*ddx + ddy*ddy + ddz*ddz;
+        }
+        rms_dist = sqrtf(rms_dist / scene.num_gaussians);
+        float dist = rms_dist * 1.5f;
+
+        printf("\n=== Benchmark: %d frames, %ux%u, SH degree %d ===\n",
+               bench_frames, render_w, render_h, max_sh_degree);
+        printf("%5s %8s %8s %8s %8s %8s %8s\n",
+               "Frame", "Proj", "Sort", "Raster", "Upscale", "Total", "FPS");
+
+        float sum_proj = 0, sum_sort = 0, sum_raster = 0, sum_upscale = 0, sum_total = 0;
+
+        for (int fi = 0; fi < bench_frames; fi++) {
+            float angle = (float)fi / (float)bench_frames * 2.0f * M_PI;
+            float elev = 0.1f * sinf(angle * 3.0f);  // gentle vertical oscillation
+
+            camera.pos[0] = cx + dist * cosf(elev) * cosf(angle);
+            camera.pos[1] = cy + dist * sinf(elev);
+            camera.pos[2] = cz + dist * cosf(elev) * sinf(angle);
+
+            float look_dx = cx - camera.pos[0], look_dz = cz - camera.pos[2];
+            float look_dy = cy - camera.pos[1];
+            float look_len = sqrtf(look_dx*look_dx + look_dz*look_dz);
+            camera.yaw = atan2f(look_dz, look_dx) * (180.0f / M_PI);
+            camera.pitch = atan2f(look_dy, look_len) * (180.0f / M_PI);
+            camera.target[0] = cx; camera.target[1] = cy; camera.target[2] = cz;
+
+            CameraParams cam_params;
+            gs_camera_get_params(camera, render_w, render_h, cam_params);
+            gs_renderer_render_frame(renderer, scene, cam_params);
+
+            const RenderStats &s = gs_renderer_get_stats(renderer);
+            printf("%5d %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f\n",
+                   fi, s.time_project_ms, s.time_sort_ms, s.time_raster_ms,
+                   s.time_upscale_ms, s.time_total_ms, s.fps);
+
+            sum_proj += s.time_project_ms;
+            sum_sort += s.time_sort_ms;
+            sum_raster += s.time_raster_ms;
+            sum_upscale += s.time_upscale_ms;
+            sum_total += s.time_total_ms;
+        }
+
+        float n = (float)bench_frames;
+        printf("──────────────────────────────────────────────────────\n");
+        printf("  AVG %7.1fms %7.1fms %7.1fms %7.1fms %7.1fms %7.1f\n",
+               sum_proj/n, sum_sort/n, sum_raster/n, sum_upscale/n, sum_total/n,
+               1000.0f / (sum_total/n));
+        printf("\nVisible (last frame): %u/%u | Tiles: %u\n",
+               renderer.stats.num_visible, scene.num_gaussians,
+               renderer.stats.num_tiles_active);
+
+        gs_renderer_deinit(renderer);
+        gs_scene_free(scene);
+        gs_sys_deinit();
         return 0;
     }
 

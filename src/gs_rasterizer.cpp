@@ -354,18 +354,18 @@ static void rasterize_tile_mau(const TileGaussians &tile,
     }
 }
 
-// Per-thread rasterization work
+// Per-thread rasterization work (atomic work-stealing)
 struct RasterThreadArg {
     const RasterContext *ctx;
     const ProjectedGaussian *gaussians;
     Framebuffer *fb;
-    uint32_t tile_start;
-    uint32_t tile_end;
     uint32_t bg_color;
     MAUContext *mau_ctx;     // nullptr if MAU unavailable
     uint32_t thread_id;
     uint32_t mau_tile_count; // output: tiles processed by MAU path
     uint32_t cpu_tile_count; // output: tiles processed by CPU path
+    volatile uint32_t *next_tile;  // shared atomic counter for work-stealing
+    uint32_t total_tiles;
 };
 
 static void rasterize_tile(const TileGaussians &tile,
@@ -701,7 +701,8 @@ static void *raster_thread_func(void *arg) {
     a->mau_tile_count = 0;
     a->cpu_tile_count = 0;
 
-    for (uint32_t t = a->tile_start; t < a->tile_end; t++) {
+    uint32_t t;
+    while ((t = __sync_fetch_and_add(a->next_tile, 1)) < a->total_tiles) {
         if (a->ctx->tiles[t].count == 0) {
             // Fill empty tile with background color
             uint32_t tx = t % tiles_x;
@@ -753,35 +754,31 @@ void gs_rasterize(const RasterContext &ctx, const ProjectedGaussian *gaussians,
                   uint32_t *out_cpu_tiles) {
     if (!ctx.allocated || ctx.num_tiles == 0) return;
 
+    volatile uint32_t next_tile = 0;
+
     pthread_t threads[NUM_RENDER_THREADS];
     RasterThreadArg args[NUM_RENDER_THREADS];
-
-    uint32_t tiles_per_thread = (ctx.num_tiles + NUM_RENDER_THREADS - 1) / NUM_RENDER_THREADS;
 
     for (uint32_t t = 0; t < NUM_RENDER_THREADS; t++) {
         args[t].ctx = &ctx;
         args[t].gaussians = gaussians;
         args[t].fb = &fb;
-        args[t].tile_start = t * tiles_per_thread;
-        args[t].tile_end = std::min((t + 1) * tiles_per_thread, ctx.num_tiles);
         args[t].bg_color = bg_color;
         args[t].mau_ctx = mau_ctx;
         args[t].thread_id = t;
         args[t].mau_tile_count = 0;
         args[t].cpu_tile_count = 0;
+        args[t].next_tile = &next_tile;
+        args[t].total_tiles = ctx.num_tiles;
 
-        if (args[t].tile_start < args[t].tile_end) {
-            pthread_create(&threads[t], nullptr, raster_thread_func, &args[t]);
-        }
+        pthread_create(&threads[t], nullptr, raster_thread_func, &args[t]);
     }
 
     uint32_t total_mau = 0, total_cpu = 0;
     for (uint32_t t = 0; t < NUM_RENDER_THREADS; t++) {
-        if (args[t].tile_start < args[t].tile_end) {
-            pthread_join(threads[t], nullptr);
-            total_mau += args[t].mau_tile_count;
-            total_cpu += args[t].cpu_tile_count;
-        }
+        pthread_join(threads[t], nullptr);
+        total_mau += args[t].mau_tile_count;
+        total_cpu += args[t].cpu_tile_count;
     }
 
     if (out_mau_tiles) *out_mau_tiles = total_mau;

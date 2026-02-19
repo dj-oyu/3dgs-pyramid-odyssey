@@ -2,6 +2,12 @@ build/
 data/*.ply
 data/reference/
 data/dump/
+data/train/
+data/models/calibration/
+data/models/calibration.tar
+data/models/calibration_data.npy
+data/models/espcn_calibration.tar
 *.o
 *.d
 /tmp/
+__pycache__/

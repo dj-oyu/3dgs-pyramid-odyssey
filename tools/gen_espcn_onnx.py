@@ -11,11 +11,12 @@ Architecture (ESPCN-x2):
   Conv(32->12, 3x3, pad=1) -> PixelShuffle(2)
 
 Input:  [1, 3, 540, 960]  float32 (NCHW, half-res)
-Output: [1, 3, 1080, 1920] float32 (NCHW, full-res)
+Output: [1, 3, 1080, 1920] uint8 (NCHW, full-res, 0-255)
 
 Modes:
   --random    Random weights (benchmark only, produces noise)
   --bilinear  Analytical bilinear upscale weights (pipeline verification)
+  --weights <path>  Load trained weights from .npz file (DCR->CRD remapped)
 
 Requires: pip3 install onnx numpy
 """
@@ -99,12 +100,55 @@ def bilinear_weights():
     return w1, b1, w2, b2, w3, b3
 
 
-def create_espcn_model(mode="bilinear"):
-    """Create ESPCN-x2 ONNX model."""
+def load_trained_weights(npz_path):
+    """Load trained weights from .npz and remap Conv3 from DCR to CRD ordering.
+
+    PyTorch PixelShuffle uses DCR mode: channels are ordered as
+      [r2*C, ...] where subpixel index varies fastest.
+      For scale=2, C=3: [sub00_c0, sub01_c0, sub10_c0, sub11_c0, sub00_c1, ...]
+      which is the same as CRD for our case (C outer, r*r inner).
+
+    Actually for scale=2, C=3, total 12 channels:
+      DCR: depth(r^2) varies fastest -> ch[d*C + c] = subpixel d, color c
+           ch0=(0,0)R, ch1=(0,0)G, ch2=(0,0)B, ch3=(0,1)R, ...
+      CRD: color varies slowest      -> ch[c*r^2 + d] = color c, subpixel d
+           ch0=(0,0)R, ch1=(0,1)R, ch2=(1,0)R, ch3=(1,1)R, ch4=(0,0)G, ...
+
+    Remapping: CRD_ch[c*4+d] = DCR_ch[d*3+c]
+    """
+    data = np.load(npz_path)
+    w1 = data['w1']
+    b1 = data['b1']
+    w2 = data['w2']
+    b2 = data['b2']
+    w3_dcr = data['w3']
+    b3_dcr = data['b3']
+
+    # Remap Conv3 weights from DCR to CRD channel ordering
+    r2 = SCALE * SCALE  # 4
+    w3_crd = np.zeros_like(w3_dcr)
+    b3_crd = np.zeros_like(b3_dcr)
+    for c in range(OUT_C):
+        for d in range(r2):
+            crd_idx = c * r2 + d
+            dcr_idx = d * OUT_C + c
+            w3_crd[crd_idx] = w3_dcr[dcr_idx]
+            b3_crd[crd_idx] = b3_dcr[dcr_idx]
+
+    print(f"  Loaded trained weights from {npz_path}")
+    print(f"  Conv3 remapped DCR -> CRD ({w3_dcr.shape[0]} channels)")
+
+    return w1, b1, w2, b2, w3_crd, b3_crd
+
+
+def create_espcn_model(mode="bilinear", weights_path=None):
+    """Create ESPCN-x2 ONNX model with uint8 output."""
 
     sub_pixel_c = OUT_C * SCALE * SCALE  # 12
 
-    if mode == "bilinear":
+    if weights_path:
+        w1, b1, w2, b2, w3, b3 = load_trained_weights(weights_path)
+    elif mode == "bilinear":
         w1, b1, w2, b2, w3, b3 = bilinear_weights()
     else:
         # Random weights (benchmark only)
@@ -129,14 +173,21 @@ def create_espcn_model(mode="bilinear"):
         helper.make_node("Relu", ["conv2"], ["relu2"], name="relu2"),
         helper.make_node("Conv", ["relu2", "w3", "b3"], ["conv3"],
                          name="conv3", kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
-        helper.make_node("DepthToSpace", ["conv3"], ["output"],
+        helper.make_node("DepthToSpace", ["conv3"], ["shuffle_out"],
                          name="pixel_shuffle", blocksize=SCALE, mode="CRD"),
+        # uint8 output: Mul(255) -> Clip(0,255) -> Cast(uint8)
+        helper.make_node("Mul", ["shuffle_out", "scale_255"], ["scaled"],
+                         name="mul_255"),
+        helper.make_node("Clip", ["scaled", "clip_min", "clip_max"], ["clipped"],
+                         name="clip_0_255"),
+        helper.make_node("Cast", ["clipped"], ["output"],
+                         name="cast_u8", to=TensorProto.UINT8),
     ]
 
     input_info = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, IN_C, IN_H, IN_W])
     output_info = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, OUT_C, OUT_H, OUT_W])
+        "output", TensorProto.UINT8, [1, OUT_C, OUT_H, OUT_W])
 
     initializers = [
         helper.make_tensor("w1", TensorProto.FLOAT, w1_shape, w1.flatten().tolist()),
@@ -145,6 +196,10 @@ def create_espcn_model(mode="bilinear"):
         helper.make_tensor("b2", TensorProto.FLOAT, [32], b2.tolist()),
         helper.make_tensor("w3", TensorProto.FLOAT, w3_shape, w3.flatten().tolist()),
         helper.make_tensor("b3", TensorProto.FLOAT, [sub_pixel_c], b3.tolist()),
+        # Constants for uint8 conversion
+        helper.make_tensor("scale_255", TensorProto.FLOAT, [], [255.0]),
+        helper.make_tensor("clip_min", TensorProto.FLOAT, [], [0.0]),
+        helper.make_tensor("clip_max", TensorProto.FLOAT, [], [255.0]),
     ]
 
     graph = helper.make_graph(
@@ -207,24 +262,40 @@ def main():
 
     # Parse mode
     mode = "bilinear"
+    weights_path = None
     if "--random" in sys.argv:
         mode = "random"
     elif "--bilinear" in sys.argv:
         mode = "bilinear"
 
+    # Check for --weights flag
+    for i, arg in enumerate(sys.argv):
+        if arg == "--weights" and i + 1 < len(sys.argv):
+            weights_path = sys.argv[i + 1]
+            mode = "trained"
+            break
+
     # Generate ONNX model
     print(f"Generating ESPCN-x2 model (mode={mode})...")
-    model = create_espcn_model(mode)
+    model = create_espcn_model(mode, weights_path)
     model_path = os.path.join(output_dir, "espcn_x2.onnx")
     onnx.save(model, model_path)
     model_size = os.path.getsize(model_path)
     print(f"  Saved: {model_path} ({model_size / 1024:.1f} KB)")
     print(f"  Input:  [1, {IN_C}, {IN_H}, {IN_W}] float32")
-    print(f"  Output: [1, {OUT_C}, {OUT_H}, {OUT_W}] float32")
-    if mode == "bilinear":
+    print(f"  Output: [1, {OUT_C}, {OUT_H}, {OUT_W}] uint8")
+    if weights_path:
+        print(f"  Weights: trained ({weights_path})")
+    elif mode == "bilinear":
         print(f"  Weights: analytical bilinear upscale (pipeline verification)")
     else:
         print(f"  Weights: random Kaiming init (benchmark only)")
+
+    # Verify output dtype
+    out_tensor = model.graph.output[0]
+    out_dtype = out_tensor.type.tensor_type.elem_type
+    assert out_dtype == TensorProto.UINT8, f"Output dtype is {out_dtype}, expected UINT8"
+    print(f"  Output dtype verified: UINT8")
 
     # Generate calibration data
     print("\nGenerating calibration data...")

@@ -125,7 +125,7 @@ void gs_renderer_render_frame(Renderer &r, const GaussianScene &scene, const Cam
 
     double t_color_start = get_time_ms();
     if (r.proj_batch.cov_count > 0)
-        gs_project_color(scene, cam, r.proj_batch);
+        gs_project_color(scene, cam, r.proj_batch, r.max_sh_degree);
     double t_color_end = get_time_ms();
 
     double t_asm_start = get_time_ms();

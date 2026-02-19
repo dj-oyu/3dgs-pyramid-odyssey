@@ -57,8 +57,9 @@ uint32_t gs_project_cov(const GaussianScene &scene, const CameraParams &cam,
 
 // Phase 3: SH evaluation
 // Outputs: color_r/g/b
+// max_sh_degree: cap SH evaluation at this degree (-1 = use scene's degree)
 void gs_project_color(const GaussianScene &scene, const CameraParams &cam,
-                       ProjectionBatch &batch);
+                       ProjectionBatch &batch, int max_sh_degree = -1);
 
 // Phase 4: Pack SoA → AoS for rasterizer
 void gs_project_assemble(const GaussianScene &scene, const ProjectionBatch &batch,

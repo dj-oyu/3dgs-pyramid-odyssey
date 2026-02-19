@@ -57,11 +57,12 @@ make clean    # Clean build artifacts
 ## Key Files
 - `include/gs_types.h` - Core data structures (SoA Gaussians, tiles)
 - `src/gs_projector.cpp` - 3D→2D projection, SH evaluation, Jacobian (most complex file)
-- `src/gs_rasterizer.cpp` - NEON tile-based rasterizer (8-thread, front-to-back, MAU > CPU dispatch)
+- `src/gs_rasterizer.cpp` - NEON tile-based rasterizer (8-thread, atomic work-stealing, front-to-back)
 - `src/gs_renderer.cpp` - Rendering pipeline orchestrator
 - `src/gs_display.cpp` - AX_VO HDMI output (with /dev/fb0 fallback)
 - `include/gs_npu.h` / `src/gs_npu.cpp` - Generic AX_ENGINE wrapper (model-agnostic)
-- `tools/gen_espcn_onnx.py` - Generate ESPCN-x2 super-resolution ONNX model
+- `tools/gen_espcn_onnx.py` - Generate ESPCN-x2 ONNX with trained weights + uint8 output
+- `tools/train_espcn.py` - Train ESPCN-x2 on rendered frames (PyTorch CPU)
 - `tools/npu_upscale_bench.cpp` - NPU super-resolution latency benchmark
 - `docs/RENDERING_DEBUG.md` - **Rendering quality debug status and analysis**
 
@@ -71,14 +72,23 @@ Current: use NPU for ESPCN-x2 super-resolution upscaling.
 - Render at 960x540 (`-s 2`), rasterize 4x fewer pixels
 - NPU 2x upscale via ESPCN CNN → 1920x1080 HDMI output
 - Enable with `--npu` flag: `sudo build/gs_splat ~/ply/Mars.ply -s 2 --npu`
-- Pipeline: ARGB→uint8 NCHW (0.5ms) → NPU inference (17ms) → float32→ARGB (14ms) = **~32ms total**
-- Performance: 540p@6.9 FPS → 1080p@5.7 FPS (+30ms for 4x resolution)
-- Current model: bilinear weights (pipeline verification), needs trained ESPCN weights for quality SR
-- Model compiled with pulsar2: `input_processors` for uint8 input, output still float32 NCHW
+- Pipeline: ARGB→uint8 NCHW → NPU inference → output→ARGB (total ~25ms)
+- ESPCN trained on 192 rendered frames (3 scenes), **42.80 dB PSNR** on validation set
+- ONNX model has uint8 output (Mul(255)→Clip→Cast baked into graph) — eliminates float32 conversion
+- Compiled .axmodel deployed: `data/models/espcn_x2.axmodel`
 - Output CMM buffer uses `AX_SYS_MemAllocCached` + `MinvalidateCache` to avoid uncached DRAM penalty
+- Details: See `docs/NPU_SUPERRES.md`
 
-## Current Status (2026-02-18)
-Rendering pipeline produces correct output. NPU super-resolution upscale pipeline working.
+## Renderer Flags
+- `--sh-degree N` — Cap SH evaluation (0=DC only, 3=full). Lower = faster projection, less color detail
+- `--bench N` — Benchmark mode: render N frames with orbit camera, print timing table, exit
+- `--npu` — Enable NPU super-resolution upscaling (requires sudo, `-s 2`)
+- `--dump <dir>` — Dump rendered frames to JPEG (no display, no sudo)
+- `-s N` — Resolution scale factor (1=1080p, 2=540p)
+
+## Current Status (2026-02-19)
+Rendering pipeline produces correct output. Rasterizer optimized (atomic work-stealing, tighter thresholds).
+NPU super-resolution pipeline working; ESPCN trained (42.80dB), compiled .axmodel deployed.
 MAU acceleration code implemented but inactive (AX650C lacks MAU hardware).
 See `docs/HARDWARE_REPORT.md` for full HW capability analysis.
 See `docs/RENDERING_DEBUG.md` for rendering quality debug history.

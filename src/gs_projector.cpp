@@ -425,10 +425,12 @@ uint32_t gs_project_cov(const GaussianScene &scene, const CameraParams &cam,
 // --- Phase 3: SH evaluation ---
 
 void gs_project_color(const GaussianScene &scene, const CameraParams &cam,
-                       ProjectionBatch &batch) {
+                       ProjectionBatch &batch, int max_sh_degree) {
     if (batch.cov_count == 0) return;
 
     int sh_degree = scene.sh_degree;
+    if (max_sh_degree >= 0 && max_sh_degree < sh_degree)
+        sh_degree = max_sh_degree;
     int rest_per_vertex = sh_rest_count(sh_degree);
     int basis_per_channel = (sh_degree > 0) ? ((sh_degree + 1) * (sh_degree + 1) - 1) : 0;
     const float *cam_pos = cam.position;

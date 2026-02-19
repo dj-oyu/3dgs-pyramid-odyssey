@@ -12,8 +12,8 @@ static constexpr uint32_t TILES_Y        = (DISPLAY_HEIGHT + TILE_SIZE - 1) / TI
 static constexpr uint32_t NUM_TILES      = TILES_X * TILES_Y;
 
 // Rasterizer constants
-static constexpr float ALPHA_THRESHOLD   = 1.0f / 255.0f;
-static constexpr float TRANSMITTANCE_MIN = 0.003f;
+static constexpr float ALPHA_THRESHOLD   = 2.0f / 255.0f;   // Skip Gaussians contributing <2 color levels
+static constexpr float TRANSMITTANCE_MIN = 0.01f;            // Earlier per-pixel saturation termination
 static constexpr uint32_t MAX_GAUSSIANS_PER_TILE = 4096;
 static constexpr uint32_t NUM_RENDER_THREADS = 8;
 
