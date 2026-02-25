@@ -8,7 +8,8 @@
 #include <arm_neon.h>
 
 // Max eigenvalue ratio for 2D covariance (prevents spike artifacts)
-static constexpr float MAX_EIGEN_RATIO = 200.0f;
+// 200 allowed 14:1 aspect ratio (needle-like). 20 limits to ~4.5:1 (smooth ellipses).
+static constexpr float MAX_EIGEN_RATIO = 20.0f;
 
 // --- Fast approximate math (NEON) ---
 // vrsqrte + 1 Newton-Raphson: ~6 cycles vs FSQRT ~14 cycles on A55
@@ -477,7 +478,7 @@ static void *cov_thread_func(void *arg) {
                 lambda_max = mid + fast_sqrtf(fmaxf(0.0f, disc));
             }
 
-            float rad = 2.0f * fast_sqrtf(lambda_max);
+            float rad = 3.0f * fast_sqrtf(lambda_max);
             if (rad > a.screen_w) continue;
             float sx = sx_a[k], sy = sy_a[k];
             if (sx + rad < 0 || sx - rad >= a.screen_w) continue;
@@ -530,7 +531,7 @@ static void *cov_thread_func(void *arg) {
             disc = mid * mid - det;
             lambda_max = mid + fast_sqrtf(fmaxf(0.0f, disc));
         }
-        float rad = 2.0f * fast_sqrtf(lambda_max);
+        float rad = 3.0f * fast_sqrtf(lambda_max);
         if (rad > a.screen_w) continue;
         if (sx + rad < 0 || sx - rad >= a.screen_w) continue;
         if (sy + rad < 0 || sy - rad >= a.screen_h) continue;
